@@ -23,6 +23,8 @@
 #include <string.h>
 #include <limits.h>
 #include <stdint.h>
+#include <time.h>
+#include <unistd.h>
 extern "C" {
 #include "l11gpu.h"
 }
@@ -197,6 +199,8 @@ static const kfn_t kernels[CMAXV+1] = { NULL, NULL, l11k<2>, l11k<3>,
 static int gpu_state = 0;   /* 0: not tried, 1: usable, -1: unusable */
 static int verbose = 0;
 
+static double now( void ) { struct timespec ts; clock_gettime( CLOCK_MONOTONIC, &ts ); return( ts.tv_sec + 1e-9 * ts.tv_nsec ); }
+
 static int init_gpu( void )
 {
 	int n = 0;
@@ -245,9 +249,11 @@ extern "C" int l11gpu_align( int nseq, char **seqs, const int *lens, const int *
 	int *dmtx = NULL;
 	batch_t bt[2];
 
+	double t0 = now(), t1, cells = 0.0;
 	for( p=0; p<npairs; p++ ) out[p].status = -1;
 	memset( bt, 0, sizeof( bt ) );
 	if( !init_gpu() ) return( 0 );
+	t1 = now();
 
 	soff = (uint32_t *)malloc( sizeof( uint32_t ) * nseq );
 	for( k=0; k<nseq; k++ ) { soff[k] = (uint32_t)total; total += lens[k] + 1; }
@@ -273,6 +279,7 @@ extern "C" int l11gpu_align( int nseq, char **seqs, const int *lens, const int *
 		if( ( l2 + 31 ) / 32 != c ) continue;
 		if( (size_t)( l1 + 1 ) * ( 32 * c ) * 2 > IJPBUDGET ) continue;
 		job[njob++] = p;
+		cells += (double)l1 * l2;
 	}
 
 	for( b=0; b<2; b++ )
@@ -390,5 +397,10 @@ done:
 	}
 	cudaFree( dcodes ); cudaFree( dchars ); cudaFree( dmtx );
 	free( hcodes ); free( soff ); free( job );
+	if( getenv( "L11GPU_LOG" ) )   /* timing diagnostics: one line per call */
+	{
+		FILE *fp = fopen( getenv( "L11GPU_LOG" ), "a" );
+		if( fp ) { fprintf( fp, "l11gpu pid %d pairs %d gpu %d cells %.0f init %.3f s total %.3f s%s\n", (int)getpid(), npairs, njob, cells, t1 - t0, now() - t0, fail ? " FAILED" : "" ); fclose( fp ); }
+	}
 	return( !fail );
 }
