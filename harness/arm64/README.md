@@ -10,7 +10,7 @@ all outputs bit for bit, and aborts on the first difference. Counts are reported
 | marks_check.py | marker-based `Lfill_int`: NEON loop, SVE loop, the scalar head cells, the row-maximum search (also AVX2/AVX-512) | Lalign11.c |
 | fillimp_check.py | `fillimp_banded` against the original segment walk (whole `impmtx` and `rowlo`/`rowhi`) | mltaln9.c |
 | igs_check.py | `igs_pairscores` with the NEON `igs_prep` and table-lookup column sums off vs on | mltaln9.c |
-| misc_check.py | NEON `makeresmap`; `part_imp_match_out_vead_gapmap` (contiguous-run loads) | mltaln9.c, partSalignmm.c |
+| misc_check.py | NEON `makeresmap`; `part_imp_match_out_vead_gapmap` (contiguous-run loads); `areg_binmajor` (alignableReagion profiles, gap runs); `cpmx_calc_new` (gap runs) | mltaln9.c, partSalignmm.c, fftFunctions.c, tddis.c |
 | row_check.py | `partA_row`, `A_row` (the non-fusing NEON rows of gcc builds; any vector build) | partSalignmm.c, Salignmm.c |
 | mcmatch_check.py | `mc_match` (NEON score table and column groups; also AVX-512) | partSalignmm.c |
 | areg_check.py | `alignableReagion` presence and profile passes (NEON; also AVX-512BW) | fftFunctions.c |
