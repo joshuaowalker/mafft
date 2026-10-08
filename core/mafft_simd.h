@@ -106,6 +106,7 @@
  *
  *   mafft_bm_eq( p, c )        a mask with one bit per byte of p[0 .. MAFFT_BM_BYTES-1]: bit
  *                              k * MAFFT_BM_BITS is set when p[k] == c, no other bit is set
+ *   mafft_bm_eqany( p, c, n )  the same for p[k] equal to any of c[0 .. n-1]
  *   MAFFT_BM_ALL               the mask with every byte's bit set
  *   MAFFT_BM_INDEX( m )        the byte index of the lowest set bit of m (m != 0); clear it with
  *                              m &= m - 1
@@ -114,14 +115,27 @@
  *
  * AVX-512BW: 64 bytes, one bit each; AVX2: 32 bytes, one bit each; NEON: 16 bytes, one bit per
  * 4 (the low bit of each nibble, which vshrn produces without a movemask).
+ *
+ * MAFFT_BM_PERCHAR (AVX-512): a block mixing characters is worth splitting into one masked add
+ * per character; elsewhere such a block is cheaper element by element (a block of gaps is one
+ * vector add everywhere).
  */
 #if defined(MAFFT_AVX512)
 #define MAFFT_BM_BYTES 64
 #define MAFFT_BM_BITS 1
 #define MAFFT_BM_ALL 0xffffffffffffffffULL
+#define MAFFT_BM_PERCHAR 1
 static inline unsigned long long mafft_bm_eq( const unsigned char *p, unsigned char c )
 {
 	return( _mm512_cmpeq_epi8_mask( _mm512_loadu_si512( (const void *)p ), _mm512_set1_epi8( (char)c ) ) );
+}
+static inline unsigned long long mafft_bm_eqany( const unsigned char *p, const unsigned char *c, int n )
+{
+	__m512i x = _mm512_loadu_si512( (const void *)p );
+	unsigned long long m = 0;
+	int k;
+	for( k=0; k<n; k++ ) m |= _mm512_cmpeq_epi8_mask( x, _mm512_set1_epi8( (char)c[k] ) );
+	return( m );
 }
 static inline void mafft_bm_addmask( double *r, unsigned long long m, double v )
 {
@@ -141,6 +155,13 @@ static inline unsigned long long mafft_bm_eq( const unsigned char *p, unsigned c
 {
 	return( (unsigned int)_mm256_movemask_epi8( _mm256_cmpeq_epi8( _mm256_loadu_si256( (const __m256i *)p ), _mm256_set1_epi8( (char)c ) ) ) );
 }
+static inline unsigned long long mafft_bm_eqany( const unsigned char *p, const unsigned char *c, int n )
+{
+	__m256i x = _mm256_loadu_si256( (const __m256i *)p ), e = _mm256_setzero_si256();
+	int k;
+	for( k=0; k<n; k++ ) e = _mm256_or_si256( e, _mm256_cmpeq_epi8( x, _mm256_set1_epi8( (char)c[k] ) ) );
+	return( (unsigned int)_mm256_movemask_epi8( e ) );
+}
 #elif defined(MAFFT_A64)
 #define MAFFT_BM_BYTES 16
 #define MAFFT_BM_BITS 4
@@ -148,6 +169,13 @@ static inline unsigned long long mafft_bm_eq( const unsigned char *p, unsigned c
 static inline unsigned long long mafft_bm_eq( const unsigned char *p, unsigned char c )
 {
 	uint8x16_t e = vceqq_u8( vld1q_u8( p ), vdupq_n_u8( c ) );
+	return( vget_lane_u64( vreinterpret_u64_u8( vshrn_n_u16( vreinterpretq_u16_u8( e ), 4 ) ), 0 ) & MAFFT_BM_ALL );
+}
+static inline unsigned long long mafft_bm_eqany( const unsigned char *p, const unsigned char *c, int n )
+{
+	uint8x16_t x = vld1q_u8( p ), e = vdupq_n_u8( 0 );
+	int k;
+	for( k=0; k<n; k++ ) e = vorrq_u8( e, vceqq_u8( x, vdupq_n_u8( c[k] ) ) );
 	return( vget_lane_u64( vreinterpret_u64_u8( vshrn_n_u16( vreinterpretq_u16_u8( e ), 4 ) ), 0 ) & MAFFT_BM_ALL );
 }
 #endif

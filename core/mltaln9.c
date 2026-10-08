@@ -717,7 +717,7 @@ static int igs_prep( char *seq, int len, int *nxt, igs_run *runs, int *nrun )
 	return( 1 );
 }
 
-#if defined(MAFFT_POPCNT)
+#if defined(MAFFT_POPCNT) && !defined(IGS_NEON)
 /*
  * igs_pairscores() with bit masks.  Each row is read 64 columns at a time into a gap mask and
  * one mask per common letter (the IGSX_NC most frequent letters of its group that make up at
@@ -1034,7 +1034,8 @@ static int igs_pairscores( char **seq1, char **seq2, int clus1, int clus2, int l
 	if( !integral ) return( 0 );
 	/* bit masks and popcounts (exact integer column sums), except where the Apple build's matrix
 	   product (igs_colsums, Accelerate) takes the large groups */
-#if defined(MAFFT_POPCNT)
+	/* (Linux arm64 keeps its NEON table lookup below, measured faster there.) */
+#if defined(MAFFT_POPCNT) && !defined(IGS_NEON)
 #if defined(__APPLE__)
 	if( MIN( clus1, clus2 ) < 24 )
 #endif
@@ -16544,6 +16545,7 @@ static int makeresmap( char *seq, int *map )
 	for( ; col+MAFFT_BM_BYTES<=len; col+=MAFFT_BM_BYTES )
 	{
 		unsigned long long m = ~mafft_bm_eq( (unsigned char *)seq + col, '-' ) & MAFFT_BM_ALL;
+		if( !m ) continue;
 		if( m == MAFFT_BM_ALL ) { int k; for( k=0; k<MAFFT_BM_BYTES; k++ ) map[n+k] = col + k; n += MAFFT_BM_BYTES; }
 		else for( ; m; m &= m - 1 ) map[n++] = col + MAFFT_BM_INDEX( m );
 	}

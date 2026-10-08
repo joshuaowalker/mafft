@@ -202,12 +202,19 @@ void cpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus )
 		feff = (double)eff[k];
 		j = 0;
 #if defined(MAFFT_BM_BYTES)
-		/* A byte mask at a time: for each character c of the block, the columns holding it get
-		   feff added in cpmx's row for c at once (mafft_bm_addmask; a block of gaps is one vector
-		   add).  Every cell still receives one addition per sequence, in sequence order. */
+		/* A byte mask at a time: a block of gaps is one vector add in cpmx's gap row; with
+		   MAFFT_BM_PERCHAR the columns holding each character c of a mixed block get feff added
+		   in c's row at once (mafft_bm_addmask), otherwise a mixed block is done element by
+		   element.  Every cell still receives one addition per sequence, in sequence order. */
 		for( ; j+MAFFT_BM_BYTES<=lgth; j+=MAFFT_BM_BYTES )
 		{
 			unsigned long long rest = MAFFT_BM_ALL;
+			if( mafft_bm_eq( s + j, '-' ) == MAFFT_BM_ALL )
+			{
+				mafft_bm_addmask( cpmx[(unsigned char)amino_n['-']] + j, MAFFT_BM_ALL, feff );
+				continue;
+			}
+#if defined(MAFFT_BM_PERCHAR)
 			while( rest )
 			{
 				unsigned char c = s[j+MAFFT_BM_INDEX( rest )];
@@ -215,6 +222,13 @@ void cpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus )
 				rest &= ~m;
 				mafft_bm_addmask( cpmx[(unsigned char)amino_n[c]] + j, m, feff );
 			}
+#else
+			{
+				int q;
+				(void)rest;
+				for( q=j; q<j+MAFFT_BM_BYTES; q++ ) cpmx[(unsigned char)amino_n[s[q]]][q] += feff;
+			}
+#endif
 		}
 #endif
 		for( ; j<lgth; j++ )

@@ -266,9 +266,8 @@ int alignableReagion( int    clus1, int    clus2,
 				unsigned char *s = (unsigned char *)( j < clus1 ? seq1[j] : seq2[j-clus1] );
 				for( i=0; i+MAFFT_BM_BYTES<=len; i+=MAFFT_BM_BYTES )
 				{
-					unsigned long long m = 0;
-					for( q=0; q<nc; q++ ) m |= mafft_bm_eq( s + i, cv[q] );
-					for( m = ~m & MAFFT_BM_ALL; m; m &= m - 1 ) seenc[s[i+MAFFT_BM_INDEX( m )]] = 1;
+					unsigned long long m = ~mafft_bm_eqany( s + i, cv, nc ) & MAFFT_BM_ALL;
+					for( ; m; m &= m - 1 ) seenc[s[i+MAFFT_BM_INDEX( m )]] = 1;
 				}
 				for( ; i<len; i++ ) seenc[s[i]] = 1;
 			}
@@ -299,9 +298,10 @@ int alignableReagion( int    clus1, int    clus2,
 			cp1 = cprf; cp2 = cprf + (size_t)len * nu;
 			memset( cprf, 0, sizeof( double ) * (size_t)len * nu * 2 );
 			/* Bin-major profiles (cp[ci*len+i]): row j adds eff[j] to the bin of its character in
-			   each column.  A byte mask at a time, for each character of the block the columns
-			   holding it get e added in its bin at once (mafft_bm_addmask; a block of gaps is one
-			   vector add); characters without a bin are skipped.  Each bin of each column still
+			   each column.  A byte mask at a time: a block of gaps is one vector add in the gap's
+			   bin (or nothing when the gap has no bin); with MAFFT_BM_PERCHAR the columns holding
+			   each character of a mixed block get e added in its bin at once (mafft_bm_addmask),
+			   otherwise a mixed block is done element by element.  Each bin of each column still
 			   receives its additions in row order, and the site score reads the same values. */
 			for( j=0; j<clus1+clus2; j++ )
 			{
@@ -312,6 +312,12 @@ int alignableReagion( int    clus1, int    clus2,
 				for( ; i+MAFFT_BM_BYTES<=len; i+=MAFFT_BM_BYTES )
 				{
 					unsigned long long rest = MAFFT_BM_ALL;
+					if( mafft_bm_eq( s + i, '-' ) == MAFFT_BM_ALL )
+					{
+						if( cidx['-'] >= 0 ) mafft_bm_addmask( cp + (size_t)cidx['-'] * len + i, MAFFT_BM_ALL, e );
+						continue;
+					}
+#if defined(MAFFT_BM_PERCHAR)
 					while( rest )
 					{
 						unsigned char c = s[i+MAFFT_BM_INDEX( rest )];
@@ -319,6 +325,13 @@ int alignableReagion( int    clus1, int    clus2,
 						rest &= ~m;
 						if( cidx[c] >= 0 ) mafft_bm_addmask( cp + (size_t)cidx[c] * len + i, m, e );
 					}
+#else
+					{
+						int q;
+						(void)rest;
+						for( q=i; q<i+MAFFT_BM_BYTES; q++ ) { int ci = cidx[s[q]]; if( ci >= 0 ) cp[(size_t)ci*len+q] += e; }
+					}
+#endif
 				}
 #endif
 				for( ; i<len; i++ ) { int ci = cidx[s[i]]; if( ci >= 0 ) cp[(size_t)ci*len+i] += e; }
