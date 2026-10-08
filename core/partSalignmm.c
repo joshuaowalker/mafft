@@ -8,8 +8,12 @@
 #else
 #define VMULADD(a,b,c) _mm512_add_pd( _mm512_mul_pd( (a), (b) ), (c) )
 #endif
-#if defined(__AVX2__) && !MAFFT_STOCK_FMA
+#if defined(MAFFT_AVX2_PATHS)
+#if MAFFT_STOCK_FMA
+#define VMULADD4(a,b,c) _mm256_fmadd_pd( (a), (b), (c) )
+#else
 #define VMULADD4(a,b,c) _mm256_add_pd( _mm256_mul_pd( (a), (b) ), (c) )
+#endif
 /* 4 x 64-bit compare mask -> 4 x 32-bit mask */
 #define PACKMASK4(c) _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_castpd_si256( c ), _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 ) ) )
 #endif
@@ -316,11 +320,11 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 			s = VMULADD( _mm512_loadu_pd( n_dis_consweight_multi[j] + l ), _mm512_set1_pd( cpmx1[j][i1] ), s );
 		_mm512_storeu_pd( scarr + l, s );
 	}
-#elif defined(__AVX2__) && !defined(__ARM_NEON) && !MAFFT_STOCK_FMA
+#elif defined(MAFFT_AVX2_PATHS)
 	/* Only the letters present in column i1 contribute: s + (+-0) == s for every s the sum can
 	   hold (it starts at +0 and a sum is never -0 under round-to-nearest), so skipping the zero
-	   terms is exact.  The remaining terms are added in ascending j, 4 letters at a time, with a
-	   separate multiply and add -- the rounding of MULADD in a build that does not contract. */
+	   terms is exact (with FMA too: a*0 is an exact +-0).  The remaining terms are added in
+	   ascending j, 4 letters at a time, each lane rounded like MULADD (VMULADD4). */
 	{
 		static TLS int *nzj = NULL, nzalloc = 0;
 		static TLS double *nzc = NULL;
@@ -331,7 +335,7 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 		{
 			__m256d s = _mm256_setzero_pd();
 			for( k=0; k<nz; k++ )
-				s = _mm256_add_pd( _mm256_mul_pd( _mm256_loadu_pd( n_dis_consweight_multi[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ) ), s );
+				s = VMULADD4( _mm256_loadu_pd( n_dis_consweight_multi[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ), s );
 			_mm256_storeu_pd( scarr + l, s );
 		}
 		for( ; l<nalphabets; l++ )
@@ -991,7 +995,7 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 		}
 		best = _mm512_cvtsd_f64( cv ); bi = _mm256_cvtsi256_si32( ck );
 	}
-#elif defined(__AVX2__) && !defined(__ARM_NEON) && !MAFFT_STOCK_FMA
+#elif defined(MAFFT_AVX2_PATHS)
 	/* The AVX-512 scan above, 4 at a time. */
 	{
 		__m256d cv = _mm256_set1_pd( best ), vpre = _mm256_set1_pd( gf1vapre );
@@ -1091,7 +1095,7 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 			vj = _mm256_add_epi32( vj, veight );
 		}
 	}
-#elif defined(__AVX2__) && !MAFFT_STOCK_FMA
+#elif defined(MAFFT_AVX2_PATHS)
 	/* The AVX-512 block above, 4 cells at a time. */
 	{
 		__m256d vgf1va = _mm256_set1_pd( gf1va ), vfgcp1va = _mm256_set1_pd( fgcp1va ), vogcp1va = _mm256_set1_pd( ogcp1va );

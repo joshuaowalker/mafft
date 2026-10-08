@@ -13071,11 +13071,12 @@ void getkyokaigap( char *g, char **s, int pos, int n )
  * Gap runs of s[0..len-1], as [st[r], en[r]) with en exclusive; returns their number.  Used by
  * the column counts below, which only ever add eff[j] to the columns where a row's gap runs
  * start, end or lie: visiting just those columns, rows in the same order, gives the same sums
- * as the column-by-column loops.  NEON finds the run boundaries 16 bytes at a time.
+ * as the column-by-column loops.  NEON finds the run boundaries 16 bytes at a time, AVX-512BW 64
+ * and AVX2 32: integer compares only, so the runs are the same in every build.
  */
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
-#elif defined(__AVX512BW__)
+#elif defined(__AVX512BW__) || defined(__AVX2__)
 #include <immintrin.h>
 #endif
 static int gapruns( char *s, int len, int *st, int *en )
@@ -13103,6 +13104,22 @@ static int gapruns( char *s, int len, int *st, int *en )
 		{
 			unsigned long long g = _mm512_cmpeq_epi8_mask( _mm512_loadu_si512( s + i ), dash );
 			unsigned long long t = g ^ ( ( g << 1 ) | (unsigned long long)in ); /* g[k] != g[k-1] */
+			while( t )
+			{
+				int b = __builtin_ctzll( t );
+				if( in ) en[n++] = i + b; else st[n] = i + b;
+				in = !in;
+				t &= t - 1;
+			}
+		}
+	}
+#elif defined(__AVX2__)
+	{
+		__m256i dash = _mm256_set1_epi8( '-' );
+		for( ; i+32<=len; i+=32 )
+		{
+			unsigned long long g = (unsigned int)_mm256_movemask_epi8( _mm256_cmpeq_epi8( _mm256_loadu_si256( (__m256i *)( s + i ) ), dash ) );
+			unsigned long long t = ( g ^ ( ( g << 1 ) | (unsigned long long)in ) ) & 0xffffffffULL; /* g[k] != g[k-1] */
 			while( t )
 			{
 				int b = __builtin_ctzll( t );
@@ -16824,11 +16841,14 @@ void fillimp_file( double **impmtx, double *imp, int clus1, int clus2, int lgth1
 #include <immintrin.h>
 /*
  * The profile-score vector every match_calc builds:  for each l, scarr[l] = 0.0 and then
- * scarr[l] += mtx[j][l] * cpmx1[j][i1] for j = 0 .. nalphabets-1, in a build that does not
- * contract a*b+c.  Only the letters present in column i1 contribute: s + (+-0) == s for every
- * value the sum can hold (it starts at +0 and a sum is never -0 under round-to-nearest), so the
- * zero terms are skipped exactly.  The rest are added in the same ascending j, 4 letters at a
- * time, each lane with its own multiply then add -- bit-identical to the scalar loop.
+ * scarr[l] += mtx[j][l] * cpmx1[j][i1] for j = 0 .. nalphabets-1.  Only the letters present in
+ * column i1 contribute: s + (+-0) == s for every value the sum can hold (it starts at +0 and a
+ * sum is never -0 under round-to-nearest), so the zero terms are skipped exactly.  The rest are
+ * added in the same ascending j, 4 letters at a time, each lane with its own multiply then add
+ * in a build that does not contract a*b+c, or with one fused multiply-add (the a*0 of a skipped
+ * term is an exact +-0 there too) in the contracting class (MAFFT_STOCK_FMA, clang on an FMA
+ * target), which compiles the stock statement to fma( mtx[j][l], cpmx1[j][i1], scarr[l] ) --
+ * bit-identical to the scalar loop either way.
  */
 void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 )
 {
@@ -16847,7 +16867,11 @@ void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 )
 	{
 		__m256d s = _mm256_setzero_pd();
 		for( k=0; k<nz; k++ )
+#if MAFFT_STOCK_FMA
+			s = _mm256_fmadd_pd( _mm256_loadu_pd( mtx[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ), s );
+#else
 			s = _mm256_add_pd( s, _mm256_mul_pd( _mm256_loadu_pd( mtx[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ) ) );
+#endif
 		_mm256_storeu_pd( scarr + l, s );
 	}
 	for( ; l<nalphabets; l++ )

@@ -1109,10 +1109,14 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 #else
 #define VMULADD(a,b,c) _mm512_add_pd( _mm512_mul_pd( (a), (b) ), (c) )
 #endif
-#elif defined(__AVX2__) && !MAFFT_STOCK_FMA
+#elif defined(MAFFT_AVX2_PATHS)
 #include <immintrin.h>
-/* a*b+c rounded like MULADD in a build that does not contract */
+/* a*b+c rounded like MULADD */
+#if MAFFT_STOCK_FMA
+#define VMULADD4(a,b,c) _mm256_fmadd_pd( (a), (b), (c) )
+#else
 #define VMULADD4(a,b,c) _mm256_add_pd( _mm256_mul_pd( (a), (b) ), (c) )
+#endif
 /* 4 x 64-bit compare mask -> 4 x 32-bit mask */
 #define PACKMASK4(c) _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_castpd_si256( c ), _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 ) ) )
 #endif
@@ -1163,7 +1167,7 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 		}
 		best = _mm512_cvtsd_f64( cv ); bi = _mm256_cvtsi256_si32( ck );
 	}
-#elif defined(__AVX2__) && !MAFFT_STOCK_FMA
+#elif defined(MAFFT_AVX2_PATHS)
 	/* The AVX-512 scan above, 4 at a time. */
 	{
 		__m256d cv = _mm256_set1_pd( best ), vpre = _mm256_set1_pd( gf1vapre ), vext = _mm256_set1_pd( ext );
@@ -1263,7 +1267,7 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 			vj = _mm256_add_epi32( vj, veight );
 		}
 	}
-#elif defined(__AVX2__) && !MAFFT_STOCK_FMA
+#elif defined(MAFFT_AVX2_PATHS)
 	/* The AVX-512 block above, 4 cells at a time. */
 	{
 		__m256d vgf1va = _mm256_set1_pd( gf1va ), vfgcp1va = _mm256_set1_pd( fgcp1va ), vogcp1va = _mm256_set1_pd( ogcp1va ), vext = _mm256_set1_pd( ext );

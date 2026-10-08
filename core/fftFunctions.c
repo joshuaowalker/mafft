@@ -1,5 +1,5 @@
 #include "mltaln.h"
-#if defined(__AVX512BW__) && !defined(__ARM_NEON)
+#if ( defined(__AVX512BW__) || defined(__AVX2__) ) && !defined(__ARM_NEON)
 #include <immintrin.h>
 #endif
 
@@ -279,6 +279,28 @@ int alignableReagion( int    clus1, int    clus2,
 				for( ; i<len; i++ ) seenc[s[i]] = 1;
 			}
 		}
+#elif defined(__AVX2__) && !defined(__ARM_NEON)
+		/* The AVX-512BW pass above, 32 bytes at a time. */
+		{
+			static const unsigned char common[] = "-acgtACGT";
+			__m256i cv[9];
+			int nc = 0, q;
+			for( q=0; common[q]; q++ )
+				if( amino_n[common[q]] >= 0 && amino_n[common[q]] < nalphabets ) { seenc[common[q]] = 1; cv[nc++] = _mm256_set1_epi8( (char)common[q] ); }
+			for( j=0; j<clus1+clus2; j++ )
+			{
+				unsigned char *s = (unsigned char *)( j < clus1 ? seq1[j] : seq2[j-clus1] );
+				for( i=0; i+32<=len; i+=32 )
+				{
+					__m256i x = _mm256_loadu_si256( (__m256i *)( s + i ) ), e = _mm256_setzero_si256();
+					unsigned int m;
+					for( q=0; q<nc; q++ ) e = _mm256_or_si256( e, _mm256_cmpeq_epi8( x, cv[q] ) );
+					m = ~(unsigned int)_mm256_movemask_epi8( e );
+					while( m ) { seenc[s[i+__builtin_ctz( m )]] = 1; m &= m - 1; }
+				}
+				for( ; i<len; i++ ) seenc[s[i]] = 1;
+			}
+		}
 #else
 		for( j=0; j<clus1; j++ ) { unsigned char *s = (unsigned char *)seq1[j]; for( i=0; i<len; i++ ) seenc[s[i]] = 1; }
 		for( j=0; j<clus2; j++ ) { unsigned char *s = (unsigned char *)seq2[j]; for( i=0; i<len; i++ ) seenc[s[i]] = 1; }
@@ -317,6 +339,26 @@ int alignableReagion( int    clus1, int    clus2,
 					while( m )
 					{
 						int ii = i + __builtin_ctzll( m ), ci = cidx[s[ii]];
+						if( ci >= 0 ) cp[ii*nu+ci] += e;
+						m &= m - 1;
+					}
+				}
+				for( ; i<len; i++ ) { int ci = cidx[s[i]]; if( ci >= 0 ) cp[i*nu+ci] += e; }
+			}
+			if( cidx['-'] >= 0 )
+#elif defined(__AVX2__) && !defined(__ARM_NEON)
+			/* The AVX-512BW pass above, 32 bytes at a time: the same adds in the same order. */
+			for( j=0; j<clus1+clus2 && cidx['-'] < 0; j++ )
+			{
+				unsigned char *s = (unsigned char *)( j < clus1 ? seq1[j] : seq2[j-clus1] );
+				double e = ( j < clus1 ) ? eff1[j] : eff2[j-clus1], *cp = ( j < clus1 ) ? cp1 : cp2;
+				__m256i dash = _mm256_set1_epi8( '-' );
+				for( i=0; i+32<=len; i+=32 )
+				{
+					unsigned int m = ~(unsigned int)_mm256_movemask_epi8( _mm256_cmpeq_epi8( _mm256_loadu_si256( (__m256i *)( s + i ) ), dash ) );
+					while( m )
+					{
+						int ii = i + __builtin_ctz( m ), ci = cidx[s[ii]];
 						if( ci >= 0 ) cp[ii*nu+ci] += e;
 						m &= m - 1;
 					}

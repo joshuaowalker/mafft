@@ -56,8 +56,15 @@
 #define MULADD(a,b,c) ( (a)*(b) + (c) )
 #endif
 
-/* scarr[l] = sum over j of mtx[j][l] * cpmx1[j][i1], added in ascending j from +0 (see mltaln9.c) */
-#if defined(__AVX2__) && !defined(__ARM_NEON) && !MAFFT_STOCK_FMA
+/* The AVX2 (4 x double) paths: in a build that does not contract a*b+c, or, with
+   MAFFT_STOCK_FMA, where FMA instructions can round like the contracting stock build. */
+#if defined(__AVX2__) && !defined(__ARM_NEON) && ( !MAFFT_STOCK_FMA || defined(__FMA__) )
+#define MAFFT_AVX2_PATHS 1
+#endif
+
+/* scarr[l] = sum over j of mtx[j][l] * cpmx1[j][i1], added in ascending j from +0 (see mltaln9.c);
+   not in the AVX-512 builds of the contracting class, whose code predates it */
+#if defined(MAFFT_AVX2_PATHS) && !( MAFFT_STOCK_FMA && defined(__AVX512F__) )
 #define HAVE_SCARR_FILL 1
 extern void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 );
 #endif
