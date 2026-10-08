@@ -81,6 +81,39 @@ static void st_FinalGapCount( double *fgcp, int clus, char **seq, double *eff, i
 
 static TLS int impalloclen = 0;
 static TLS double **impmtx = NULL;
+#if defined(__linux__) && defined(__aarch64__)
+/*
+ * impmtx in one block of transparent huge pages (Linux arm64): fillimp_track's walk touches a
+ * different row, i.e. a different 4 KB page, at every step, so with separately allocated rows
+ * most of its loads also miss the TLB.  Only the memory layout changes.
+ */
+#include <stdint.h>
+extern int madvise( void *, size_t, int );
+static TLS char *impblock = NULL;
+static double **imp_alloc( int n )
+{
+	size_t huge = (size_t)2 << 20, bytes = (size_t)n * n * sizeof( double );
+	double **mtx = calloc( n + 1, sizeof( double * ) ), *base;
+	int i;
+	impblock = malloc( bytes + huge );
+	if( !mtx || !impblock ) ErrorExit( "Cannot allocate impmtx." );
+	base = (double *)( ( (uintptr_t)impblock + huge - 1 ) & ~(uintptr_t)( huge - 1 ) );
+	madvise( base, ( bytes + huge - 1 ) & ~( huge - 1 ), 14 /* MADV_HUGEPAGE */ );
+	for( i=0; i<n; i++ ) mtx[i] = base + (size_t)i * n;
+	mtx[n] = NULL;
+	return( mtx );
+}
+static void imp_free( double **mtx )
+{
+	free( impblock ); impblock = NULL;
+	free( mtx );
+}
+#define AllocateImpMtx( n ) imp_alloc( n )
+#define FreeImpMtx( m ) imp_free( m )
+#else
+#define AllocateImpMtx( n ) AllocateFloatMtx( n, n )
+#define FreeImpMtx( m ) FreeFloatMtx( m )
+#endif
 static TLS int *improwlo = NULL, *improwhi = NULL;
 static TLS int impclean = 0; /* 1: impmtx is zero outside [improwlo[i],improwhi[i]] */
 double part_imp_match_out_sc( int i1, int j1 )
@@ -170,7 +203,7 @@ void part_imp_match_init_strict( double *imp, int clus1, int clus2, int lgth1, i
 
 	if( seq1 == NULL )
 	{
-		if( impmtx ) FreeFloatMtx( impmtx );
+		if( impmtx ) FreeImpMtx( impmtx );
 		impmtx = NULL;
 		free( improwlo ); free( improwhi ); improwlo = improwhi = NULL; impclean = 0;
 //		if( nocount1 ) free( nocount1 );
@@ -183,11 +216,11 @@ void part_imp_match_init_strict( double *imp, int clus1, int clus2, int lgth1, i
 
 	if( impalloclen < lgth1 + 2 || impalloclen < lgth2 + 2 )
 	{
-		if( impmtx ) FreeFloatMtx( impmtx );
+		if( impmtx ) FreeImpMtx( impmtx );
 //		if( nocount1 ) free( nocount1 );
 //		if( nocount2 ) free( nocount2 );
 		impalloclen = MAX( lgth1, lgth2 ) + 2;
-		impmtx = AllocateFloatMtx( impalloclen, impalloclen );
+		impmtx = AllocateImpMtx( impalloclen );
 //		nocount1 = AllocateCharVec( impalloclen );
 //		nocount2 = AllocateCharVec( impalloclen );
 		free( improwlo ); free( improwhi );
