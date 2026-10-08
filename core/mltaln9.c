@@ -717,8 +717,7 @@ static int igs_prep( char *seq, int len, int *nxt, igs_run *runs, int *nrun )
 	return( 1 );
 }
 
-#if defined(MAFFT_AVX512X)
-#include <stdint.h>
+#if defined(MAFFT_POPCNT)
 /*
  * igs_pairscores() with bit masks.  Each row is read 64 columns at a time into a gap mask and
  * one mask per common letter (the IGSX_NC most frequent letters of its group that make up at
@@ -755,12 +754,21 @@ static uint64_t igsx_lenmask( int len, int w )
 	return( ( len - w * 64 >= 64 ) ? ~0ULL : ( ( 1ULL << ( len - w * 64 ) ) - 1 ) );
 }
 
+/* bit k: x[k] == c for the 64 bytes of a word (x points into the row, or at a zero-padded copy
+   of its last, shorter word) */
+#define IGSX_EQ( x, c ) mafft_eq64( (x), (c) )
+static unsigned char *igsx_word( unsigned char *s, int len, int w, unsigned char *pad )
+{
+	if( len - w * 64 >= 64 ) return( s + w * 64 );
+	memset( pad, 0, 64 ); memcpy( pad, s + w * 64, len - w * 64 );
+	return( pad );
+}
+
 /* pass 1 over a group: checks the rows (len 7-bit characters, then NUL) and counts each letter */
 static int igsx_count( char **seq, int n, int len, unsigned char *let, long *cnt, int *nlet )
 {
 	int r, w, q, nw = ( len + 63 ) / 64;
-	const __m512i dash = _mm512_set1_epi8( '-' );
-	__m512i lv[IGSX_MAXL];
+	unsigned char pad[64];
 	*nlet = 0;
 	for( r=0; r<n; r++ )
 	{
@@ -769,9 +777,9 @@ static int igsx_count( char **seq, int n, int len, unsigned char *let, long *cnt
 		for( w=0; w<nw; w++ )
 		{
 			uint64_t lm = igsx_lenmask( len, w ), seen, rest;
-			__m512i x = _mm512_maskz_loadu_epi8( lm, (void *)( s + w * 64 ) );
-			seen = _mm512_cmpeq_epi8_mask( x, dash );
-			for( q=0; q<*nlet; q++ ) { uint64_t m = _mm512_cmpeq_epi8_mask( x, lv[q] ); cnt[q] += __builtin_popcountll( m & lm ); seen |= m; }
+			unsigned char *x = igsx_word( s, len, w, pad );
+			seen = IGSX_EQ( x, '-' );
+			for( q=0; q<*nlet; q++ ) { uint64_t m = IGSX_EQ( x, let[q] ); cnt[q] += __builtin_popcountll( m & lm ); seen |= m; }
 			rest = ~seen & lm;
 			while( rest )
 			{
@@ -779,8 +787,8 @@ static int igsx_count( char **seq, int n, int len, unsigned char *let, long *cnt
 				uint64_t m;
 				if( c == 0 || c >= 0x80 || *nlet >= IGSX_MAXL ) return( 0 );
 				q = (*nlet)++;
-				let[q] = c; lv[q] = _mm512_set1_epi8( (char)c );
-				m = _mm512_cmpeq_epi8_mask( x, lv[q] ) & lm;
+				let[q] = c;
+				m = IGSX_EQ( x, c ) & lm;
 				cnt[q] = __builtin_popcountll( m );
 				rest &= ~m;
 			}
@@ -810,13 +818,13 @@ static int igsx_common( unsigned char *let, long *cnt, int nlet, unsigned char *
 static int igsx_row( unsigned char *s, int len, int nw8, uint64_t *gap, uint64_t *pl, unsigned char *com, int nc, igsx_rare *rare, int nrare, int maxrare, int row )
 {
 	int w, q, nw = ( len + 63 ) / 64;
-	const __m512i dash = _mm512_set1_epi8( '-' );
+	unsigned char pad[64];
 	for( w=0; w<nw; w++ )
 	{
 		uint64_t lm = igsx_lenmask( len, w ), seen, rest;
-		__m512i x = _mm512_maskz_loadu_epi8( lm, (void *)( s + w * 64 ) );
-		seen = gap[w] = _mm512_cmpeq_epi8_mask( x, dash ) & lm;
-		for( q=0; q<nc; q++ ) { uint64_t m = _mm512_cmpeq_epi8_mask( x, _mm512_set1_epi8( (char)com[q] ) ) & lm; pl[q*nw8+w] = m; seen |= m; }
+		unsigned char *x = igsx_word( s, len, w, pad );
+		seen = gap[w] = IGSX_EQ( x, '-' ) & lm;
+		for( q=0; q<nc; q++ ) { uint64_t m = IGSX_EQ( x, com[q] ) & lm; pl[q*nw8+w] = m; seen |= m; }
 		rest = ~seen & lm;
 		while( rest )
 		{
@@ -896,18 +904,17 @@ static int igs_pairscores_x( char **seq1, char **seq2, int clus1, int clus2, int
 		for( j=0; j<clus2; j++ )
 		{
 			uint64_t *p2 = pl + (size_t)( clus1 + j ) * nw8 * IGSX_NC;
-			__m512i acc = _mm512_setzero_si512();
+			long long acc = 0;
 			int w;
 			for( q1=0; q1<nc1; q1++ ) for( q2=0; q2<nc2; q2++ )
 			{
-				__m512i n = _mm512_setzero_si512();
+				uint64_t *a = p1 + q1 * nw8, *b = p2 + q2 * nw8;
+				long long n = 0;
 				if( d[q1][q2] == 0 ) continue;
-				for( w=0; w<nw8; w+=8 )
-					n = _mm512_add_epi64( n, _mm512_popcnt_epi64( _mm512_and_si512( _mm512_loadu_si512( (void *)( p1 + q1 * nw8 + w ) ), _mm512_loadu_si512( (void *)( p2 + q2 * nw8 + w ) ) ) ) );
-				/* counts are below 2^31: a signed 32x32->64 multiply of the low halves is exact */
-				acc = _mm512_add_epi64( acc, _mm512_mul_epi32( n, _mm512_set1_epi64( d[q1][q2] ) ) );
+				for( w=0; w<nw8; w++ ) n += __builtin_popcountll( a[w] & b[w] );
+				acc += n * d[q1][q2];
 			}
-			cs[i*clus2+j] = _mm512_reduce_add_epi64( acc );
+			cs[i*clus2+j] = acc;
 		}
 	}
 	for( r=0; r<nr1; r++ )
@@ -965,9 +972,10 @@ static int igs_pairscores_x( char **seq1, char **seq2, int clus1, int clus2, int
 	free( gap ); free( pl ); free( runbuf ); free( nrun ); free( rare1 ); free( rare2 ); free( cs );
 	return( 1 );
 }
+
 #endif
 
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 /* The column-major test "if( cpmx[l][j] )" of the match_calc set-ups, 8 columns at a time:
    bit l of mask[j] is set when cpmx[l][j] != 0 (NaN included, -0.0 not, as in C). */
 void cpmx_colmask( double **cpmx, int nalph, int lgth, unsigned int *mask )
@@ -1024,7 +1032,12 @@ static int igs_pairscores( char **seq1, char **seq2, int clus1, int clus2, int l
 		}
 	}
 	if( !integral ) return( 0 );
-#if defined(MAFFT_AVX512X)
+	/* bit masks and popcounts (exact integer column sums), except where the Apple build's matrix
+	   product (igs_colsums, Accelerate) takes the large groups */
+#if defined(MAFFT_POPCNT)
+#if defined(__APPLE__)
+	if( MIN( clus1, clus2 ) < 24 )
+#endif
 	if( igs_pairscores_x( seq1, seq2, clus1, clus2, len, out, dzi ) ) return( 1 );
 #endif
 
@@ -13499,57 +13512,21 @@ void getkyokaigap( char *g, char **s, int pos, int n )
  * Gap runs of s[0..len-1], as [st[r], en[r]) with en exclusive; returns their number.  Used by
  * the column counts below, which only ever add eff[j] to the columns where a row's gap runs
  * start, end or lie: visiting just those columns, rows in the same order, gives the same sums
- * as the column-by-column loops.  NEON finds the run boundaries 16 bytes at a time, AVX-512BW 64
- * and AVX2 32: integer compares only, so the runs are the same in every build.
+ * as the column-by-column loops.  The run boundaries are found a byte mask at a time
+ * (mafft_bm_eq): integer compares only, so the runs are the same in every build.
  */
 static int gapruns( char *s, int len, int *st, int *en )
 {
 	int i = 0, n = 0, in = 0;
-#if defined(MAFFT_A64)
-	uint8x16_t dash = vdupq_n_u8( '-' ), zero = vdupq_n_u8( 0 ), ones = vdupq_n_u8( 0xff );
-	for( ; i+16<=len; i+=16 )
+#if defined(MAFFT_BM_BYTES)
+	for( ; i+MAFFT_BM_BYTES<=len; i+=MAFFT_BM_BYTES )
 	{
-		uint8x16_t g = vceqq_u8( vld1q_u8( (uint8_t *)s + i ), dash );
-		uint8x16_t t = veorq_u8( g, vextq_u8( in ? ones : zero, g, 15 ) ); /* g[k] != g[k-1] */
-		uint64_t bits = vget_lane_u64( vreinterpret_u64_u8( vshrn_n_u16( vreinterpretq_u16_u8( t ), 4 ) ), 0 );
-		while( bits )
+		unsigned long long g = mafft_bm_eq( (unsigned char *)s + i, '-' );
+		unsigned long long t = ( g ^ ( ( g << MAFFT_BM_BITS ) | (unsigned long long)in ) ) & MAFFT_BM_ALL; /* g[k] != g[k-1] */
+		for( ; t; t &= t - 1 )
 		{
-			int b = __builtin_ctzll( bits ) >> 2;
-			if( in ) en[n++] = i + b; else st[n] = i + b;
+			if( in ) en[n++] = i + MAFFT_BM_INDEX( t ); else st[n] = i + MAFFT_BM_INDEX( t );
 			in = !in;
-			bits &= ~( 0xfULL << ( b * 4 ) );
-		}
-	}
-#elif defined(MAFFT_AVX512)
-	{
-		__m512i dash = _mm512_set1_epi8( '-' );
-		for( ; i+64<=len; i+=64 )
-		{
-			unsigned long long g = _mm512_cmpeq_epi8_mask( _mm512_loadu_si512( s + i ), dash );
-			unsigned long long t = g ^ ( ( g << 1 ) | (unsigned long long)in ); /* g[k] != g[k-1] */
-			while( t )
-			{
-				int b = __builtin_ctzll( t );
-				if( in ) en[n++] = i + b; else st[n] = i + b;
-				in = !in;
-				t &= t - 1;
-			}
-		}
-	}
-#elif defined(MAFFT_AVX2_NEWPATHS)
-	{
-		__m256i dash = _mm256_set1_epi8( '-' );
-		for( ; i+32<=len; i+=32 )
-		{
-			unsigned long long g = (unsigned int)_mm256_movemask_epi8( _mm256_cmpeq_epi8( _mm256_loadu_si256( (__m256i *)( s + i ) ), dash ) );
-			unsigned long long t = ( g ^ ( ( g << 1 ) | (unsigned long long)in ) ) & 0xffffffffULL; /* g[k] != g[k-1] */
-			while( t )
-			{
-				int b = __builtin_ctzll( t );
-				if( in ) en[n++] = i + b; else st[n] = i + b;
-				in = !in;
-				t &= t - 1;
-			}
 		}
 	}
 #endif
@@ -16557,73 +16534,29 @@ static void movereg_swap( char *seq1, char *seq2, LocalHom *tmpptr, int *start1p
 	}
 }
 
-/* Residue index -> alignment column map for one gapped sequence.  Returns the number of residues. */
+/* Residue index -> alignment column map for one gapped sequence.  Returns the number of residues.
+   A byte mask at a time: a block of residues is a run of consecutive columns, otherwise the
+   non-gap columns are taken in order from the mask. */
 static int makeresmap( char *seq, int *map )
 {
-	int n = 0, col;
-#ifdef IGS_NEON
-	/* 16 columns at a time where they are all gaps (skipped) or all residues (16 entries) */
-	int len = (int)strlen( seq );
-	const uint8x16_t dash = vdupq_n_u8( '-' );
-	const int32x4_t four = vdupq_n_s32( 4 ), step = { 0, 1, 2, 3 };
-	for( col=0; col+16<=len; col+=16 )
+	int n = 0, col = 0, len = (int)strlen( seq );
+#if defined(MAFFT_BM_BYTES)
+	for( ; col+MAFFT_BM_BYTES<=len; col+=MAFFT_BM_BYTES )
 	{
-		uint8x16_t g = vceqq_u8( vld1q_u8( (unsigned char *)seq + col ), dash );
-		if( vminvq_u8( g ) ) continue;
-		if( !vmaxvq_u8( g ) )
-		{
-			int32x4_t v = vaddq_s32( vdupq_n_s32( col ), step );
-			vst1q_s32( map + n, v ); v = vaddq_s32( v, four );
-			vst1q_s32( map + n + 4, v ); v = vaddq_s32( v, four );
-			vst1q_s32( map + n + 8, v ); v = vaddq_s32( v, four );
-			vst1q_s32( map + n + 12, v );
-			n += 16;
-		}
-		else
-		{
-			int c;
-			for( c=col; c<col+16; c++ ) if( seq[c] != '-' ) map[n++] = c;
-		}
+		unsigned long long m = ~mafft_bm_eq( (unsigned char *)seq + col, '-' ) & MAFFT_BM_ALL;
+		if( m == MAFFT_BM_ALL ) { int k; for( k=0; k<MAFFT_BM_BYTES; k++ ) map[n+k] = col + k; n += MAFFT_BM_BYTES; }
+		else for( ; m; m &= m - 1 ) map[n++] = col + MAFFT_BM_INDEX( m );
 	}
-	for( ; col<len; col++ ) if( seq[col] != '-' ) map[n++] = col;
-	return( n );
 #endif
-	for( col=0; seq[col]; col++ ) if( seq[col] != '-' ) map[n++] = col;
-	return( n );
-}
-#if defined(MAFFT_AVX512X)
-/* makeresmap() 64 columns at a time: the non-gap columns of each 16 are compressed out of a vector
-   of column numbers, in order.  map[] needs 16 spare entries (the stores are whole vectors). */
-static int makeresmap_avx512( char *seq, int *map )
-{
-	int n = 0, col = 0, len = strlen( seq ), q;
-	const __m512i dash = _mm512_set1_epi8( '-' ), step = _mm512_set1_epi32( 16 );
-	for( ; col+64<=len; col+=64 )
-	{
-		unsigned long long m = _mm512_cmpneq_epi8_mask( _mm512_loadu_si512( (void *)( seq + col ) ), dash );
-		__m512i c = _mm512_add_epi32( _mm512_set1_epi32( col ), _mm512_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 ) );
-		for( q=0; q<4; q++ )
-		{
-			__mmask16 k = (__mmask16)( m >> ( 16 * q ) );
-			_mm512_storeu_si512( (void *)( map + n ), _mm512_maskz_compress_epi32( k, c ) );
-			n += __builtin_popcount( (unsigned)k );
-			c = _mm512_add_epi32( c, step );
-		}
-	}
 	for( ; col<len; col++ ) if( seq[col] != '-' ) map[n++] = col;
 	return( n );
 }
-#define makeresmap( s, m ) makeresmap_avx512( s, m )
-#define RESMAP_SLACK 16
-#else
-#define RESMAP_SLACK 0
-#endif
 
 /*
  * The segment walk of fillimp_track() in bands of FILLIMP_BAND rows of impmtx.  The walk touches
  * about 1.7 billion cells per L-INS-i shard spread over a ~32 MB matrix; a core's L2 (1-2 MB on
- * Graviton, 1-2 MB on Zen 4/5 and Sapphire Rapids) holds a band of rows but not the matrix.  Every cell lies in exactly one
- * band, and within a band the segments are visited in the original (i, j, segment) order, so each
+ * Graviton, Zen 4/5 and Sapphire Rapids) holds a band of rows but not the matrix.  Every cell lies
+ * in exactly one band, and within a band the segments are visited in the original (i, j, segment) order, so each
  * cell receives the same multiply-adds in the same order as in the original walk: impmtx is
  * bit-identical, and rowlo/rowhi (minima and maxima) are too.  Each segment keeps a cursor, as its
  * rows increase with n.  Returns 0 (nothing done) without rowlo, or when any segment is out of
@@ -16766,8 +16699,8 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 	map2 = malloc( clus2 * sizeof( int * ) );
 	nres1 = malloc( clus1 * sizeof( int ) );
 	nres2 = malloc( clus2 * sizeof( int ) );
-	for( i=0; i<clus1; i++ ) { map1[i] = malloc( ( lgth1 + 1 + RESMAP_SLACK ) * sizeof( int ) ); nres1[i] = makeresmap( seq1[i], map1[i] ); }
-	for( j=0; j<clus2; j++ ) { map2[j] = malloc( ( lgth2 + 1 + RESMAP_SLACK ) * sizeof( int ) ); nres2[j] = makeresmap( seq2[j], map2[j] ); }
+	for( i=0; i<clus1; i++ ) { map1[i] = malloc( ( lgth1 + 1 ) * sizeof( int ) ); nres1[i] = makeresmap( seq1[i], map1[i] ); }
+	for( j=0; j<clus2; j++ ) { map2[j] = malloc( ( lgth2 + 1 ) * sizeof( int ) ); nres2[j] = makeresmap( seq2[j], map2[j] ); }
 
 #if FILLIMP_BAND > 0
 	if( fillimp_banded( impmtx, fi_base, fi_stride, clus1, clus2, lgth1, eff1, eff2, eff1_kozo, eff2_kozo, effijx, localhom, swaplist, orinum1, orinum2, rowlo, rowhi, map1, map2, nres1, nres2 ) )

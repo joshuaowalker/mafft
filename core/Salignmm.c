@@ -300,7 +300,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
 	if( initialize )
 	{
 		int count = 0;
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 		/* the nonzero letters of each column in ascending l, as the loop below finds them */
 		if( nalphabets <= 32 )
 		{

@@ -196,79 +196,32 @@ void cpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus )
 		while( i-- )
 			*cpmxpt++ = 0.0;
 	}
-#if defined(MAFFT_AVX512X)
-	/* 64 columns at a time: for each character c of the block, the columns holding it get feff
-	   added in cpmx's row for c, 8 at a time under a mask; every cell still receives one addition
-	   per sequence, in sequence order. */
 	for( k=0; k<clus; k++ )
 	{
-		__m512d vf = _mm512_set1_pd( (double)eff[k] );
 		unsigned char *s = (unsigned char *)seq[k];
 		feff = (double)eff[k];
-		for( j=0; j+64<=lgth; j+=64 )
+		j = 0;
+#if defined(MAFFT_BM_BYTES)
+		/* A byte mask at a time: for each character c of the block, the columns holding it get
+		   feff added in cpmx's row for c at once (mafft_bm_addmask; a block of gaps is one vector
+		   add).  Every cell still receives one addition per sequence, in sequence order. */
+		for( ; j+MAFFT_BM_BYTES<=lgth; j+=MAFFT_BM_BYTES )
 		{
-			__m512i x = _mm512_loadu_si512( (void *)( s + j ) );
-			unsigned long long rest = ~0ULL;
+			unsigned long long rest = MAFFT_BM_ALL;
 			while( rest )
 			{
-				unsigned char c = s[j+__builtin_ctzll( rest )];
-				unsigned long long m = _mm512_cmpeq_epi8_mask( x, _mm512_set1_epi8( (char)c ) ) & rest;
-				double *row = cpmx[(unsigned char)amino_n[c]] + j;
-				int q;
+				unsigned char c = s[j+MAFFT_BM_INDEX( rest )];
+				unsigned long long m = mafft_bm_eq( s + j, c ) & rest;
 				rest &= ~m;
-				for( q=0; q<8; q++ )
-				{
-					__mmask8 m8 = (__mmask8)( m >> ( 8 * q ) );
-					_mm512_mask_storeu_pd( row + 8 * q, m8, _mm512_add_pd( _mm512_maskz_loadu_pd( m8, row + 8 * q ), vf ) );
-				}
+				mafft_bm_addmask( cpmx[(unsigned char)amino_n[c]] + j, m, feff );
 			}
 		}
+#endif
 		for( ; j<lgth; j++ )
 			cpmx[(unsigned char)amino_n[s[j]]][j] += feff;
 	}
 	(void)seqpt;
 }
-#else
-#if defined(MAFFT_A64)
-	/* 16 columns at a time where they are all gaps: one row of cpmx, 8 vector adds.  Each
-	   element receives the same additions in the same order (Linux arm64). */
-	{
-		const uint8x16_t dash = vdupq_n_u8( '-' );
-		for( k=0; k<clus; k++ )
-		{
-			float64x2_t ve;
-			feff = (double)eff[k];
-			ve = vdupq_n_f64( feff );
-			seqpt = seq[k];
-			for( j=0; j+16<=lgth; j+=16 )
-			{
-				if( vminvq_u8( vceqq_u8( vld1q_u8( (unsigned char *)seqpt + j ), dash ) ) )
-				{
-					double *cg = cpmx[(unsigned char)amino_n['-']];
-					for( i=0; i<16; i+=2 ) vst1q_f64( cg + j + i, vaddq_f64( vld1q_f64( cg + j + i ), ve ) );
-				}
-				else
-				{
-					for( i=j; i<j+16; i++ ) cpmx[(unsigned char)amino_n[(unsigned char)seqpt[i]]][i] += feff;
-				}
-			}
-			for( ; j<lgth; j++ ) cpmx[(unsigned char)amino_n[(unsigned char)seqpt[j]]][j] += feff;
-		}
-		return;
-	}
-#endif
-	for( k=0; k<clus; k++ )
-	{
-		feff = (double)eff[k];
-		seqpt = seq[k];
-//		fprintf( stderr, "seqpt = %s, lgth=%d\n", seqpt, lgth );
-		for( j=0; j<lgth; j++ )
-		{
-			cpmx[(unsigned char)amino_n[(unsigned char)*seqpt++]][j] += feff;
-		}
-	}
-}
-#endif
 void MScpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus ) // summ eff must be 1.0
 {
 	int  i, j, k;

@@ -40,7 +40,7 @@
 #define VERSION "7.526-opt7"
 #define SHOWVERSION reporterr( "%s (%s) Version " VERSION "\nalg=%c, model=%s, amax=%3.1f\n%d thread(s)\n\n", progName( argv[0] ), (dorp=='d')?"nuc":((nblosum==-2)?"text":"aa"), alg, modelname, specificityconsideration, nthread )
 
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 /* bit l of mask[j] = ( cpmx[l][j] != 0 ) for l < nalph <= 32 (mltaln9.c) */
 extern void cpmx_colmask( double **cpmx, int nalph, int lgth, unsigned int *mask );
 #endif

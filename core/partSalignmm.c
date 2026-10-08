@@ -261,7 +261,7 @@ static TLS double *mc_val = NULL;    /* value of the k-th letter of the column a
 static TLS int *mc_vstart = NULL;
 static TLS double *mc_scarr = NULL;
 
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 /*
  * match_calc by blocks of 8 consecutive columns, without the scatter of the grouped version.
  * Level k of a block holds, for each of its 8 columns, the k-th nonzero letter of the column (in
@@ -356,7 +356,7 @@ static void mc_build( double **cpmx2, int lgth2 )
 	int j, l, g, k, n, cnt, *key, *colgrp, *keyoff, *keycnt, *fill;
 	unsigned long long h, *hash;
 	int nkey = 0, tabsize, *tab, keylen = 0;
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 	unsigned int *colm = NULL;
 #endif
 
@@ -381,14 +381,14 @@ static void mc_build( double **cpmx2, int lgth2 )
 	tab = malloc( sizeof( int ) * tabsize );
 	for( k=0; k<tabsize; k++ ) tab[k] = -1;
 
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 	if( nalphabets <= 32 ) { colm = malloc( sizeof( unsigned int ) * ( lgth2 + 1 ) ); cpmx_colmask( cpmx2, nalphabets, lgth2, colm ); }
 #endif
 	for( j=0; j<lgth2; j++ )
 	{
 		int *kj = key + keylen, slot;
 		cnt = 0; h = 1469598103934665603ULL;
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 		if( colm )
 		{
 			unsigned int m;
@@ -447,7 +447,7 @@ static void mc_build( double **cpmx2, int lgth2 )
 		}
 	}
 	free( key ); free( colgrp ); free( keyoff ); free( keycnt ); free( hash ); free( tab ); free( fill );
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 	mcx_build( cpmx2, lgth2, colm );
 	free( colm );
 #endif
@@ -457,13 +457,13 @@ static void mc_build( double **cpmx2, int lgth2 )
 
 static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 {
-	int g, k, l, j, n;
+	int g, k, n;
 	double *scarr;
 	static TLS int scalloc = 0;
 	if( scalloc < nalphabets ) { free( mc_scarr ); scalloc = nalphabets; mc_scarr = malloc( sizeof( double ) * scalloc ); }
 	scarr = mc_scarr;
 	scarr_fill( scarr, n_dis_consweight_multi, cpmx1, i1 );
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 	if( mcx_ok ) { mcx_apply( match, scarr, lgth2 ); return; }
 #endif
 	for( g=0; g<mc_ngrp; g++ )
@@ -554,7 +554,7 @@ static void match_calc( double *match, double **cpmx1, double **cpmx2, int i1, i
 	if( initialize )
 	{
 		int count = 0;
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 		/* the nonzero letters of each column in ascending l, as the loop below finds them */
 		if( nalphabets <= 32 )
 		{
@@ -785,7 +785,6 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
 #endif
 }
 
-#if defined(MAFFT_AVX512X)
 /* Do the non-negative entries of col[0..ncol) run first, first+1, first+2, ...? */
 static int at_consecutive( int *col, int ncol, int *first )
 {
@@ -800,11 +799,13 @@ static int at_consecutive( int *col, int ncol, int *first )
 	return( 1 );
 }
 
-/* For such a col: d[c] = ( col[c] >= 0 ) ? s[col[c]] : gap for every row, 64 columns at a time,
-   the next residues of the row expanded into the non-gap columns. */
+/* For such a col: d[c] = ( col[c] >= 0 ) ? s[col[c]] : gap for every row, i.e. the row's next
+   residues in order into the non-gap columns (with VBMI2, 64 columns at a time by expand). */
 static void at_expand( char **seq, char **mseq, int n, int *col, int ncol, int cp, int first, char gapc )
 {
-	int nw = ( ncol + 63 ) / 64, w, r, c;
+	int r, c;
+#if defined(MAFFT_AVX512_VBMI2)
+	int nw = ( ncol + 63 ) / 64, w;
 	unsigned long long *m = malloc( sizeof( unsigned long long ) * ( nw + 1 ) );
 	const __m512i vgap = _mm512_set1_epi8( gapc );
 	for( w=0; w<nw; w++ )
@@ -835,8 +836,17 @@ static void at_expand( char **seq, char **mseq, int n, int *col, int ncol, int c
 		d[ncol] = 0;
 	}
 	free( m );
-}
+#else
+	for( r=0; r<n; r++ )
+	{
+		char *s = seq[r] + first, *d;
+		mseq[r] += cp;
+		d = mseq[r];
+		for( c=0; c<ncol; c++ ) d[c] = ( col[c] >= 0 ) ? *s++ : gapc;
+		d[ncol] = 0;
+	}
 #endif
+}
 
 static void Atracking_localhom( double *impwmpt, double *lasthorizontalw, double *lastverticalw, 
 						char **seq1, char **seq2, 
@@ -968,7 +978,6 @@ static void Atracking_localhom( double *impwmpt, double *lasthorizontalw, double
 	}
 	{
 		int c, ncol = lgth1+lgth2-cp;
-#if defined(MAFFT_AVX512X)
 		int f1, f2;
 		if( at_consecutive( col1 + cp, ncol, &f1 ) && at_consecutive( col2 + cp, ncol, &f2 ) )
 		{
@@ -976,7 +985,6 @@ static void Atracking_localhom( double *impwmpt, double *lasthorizontalw, double
 			at_expand( seq2, mseq2, jcyc, col2 + cp, ncol, cp, f2, *gap );
 		}
 		else
-#endif
 		{
 		for( i=0; i<icyc; i++ )
 		{
@@ -1160,7 +1168,7 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 
 	MI[1] = mi0; MPI[1] = 0;
 	j = 1;
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 	/* The scan below with a shorter loop-carried chain: the block's own scan and its last lane are
 	   computed without the carry, then the carry is applied to every lane and to the last lane
 	   separately -- the same pairwise rule ("replace only if strictly greater"), so the same

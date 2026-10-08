@@ -144,11 +144,16 @@ static int lres_vmp( int i, int j )
 }
 #endif
 
+#if defined(MAFFT_AVX512)
+static int kb_ijv( int i, int j, int lstop );
+static int kb_isstop( int i, int j );
+#endif
+/* kb: the fill was Lfill_kb, whose traceback is read through kb_ijv() instead of ijp */
 static double Ltracking( double *lasthorizontalw, double *lastverticalw, 
 						char **seq1, char **seq2, 
                         char **mseq1, char **mseq2, 
                         int **ijp, int *off1pt, int *off2pt, int endi, int endj,
-						int *warpis, int *warpjs, int warpbase )
+						int *warpis, int *warpjs, int warpbase, int kb )
 {
 	int i, j, l, iin, jin, lgth1, lgth2, k, limk;
 	int ifi=0, jfi=0; // by D.Mathog, a guess
@@ -183,10 +188,15 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
 	for( k=0; k<=limk; k++ ) 
 	{
 		int ijv = ijp[iin][jin];
+#if defined(MAFFT_AVX512)
+		if( kb ) ijv = kb_ijv( iin, jin, localstop );
+		else
+#endif
 #ifdef LFILL_MARKS
 		if( ijv == LMARK_H ) ijv = -( jin - lres_hk( iin, jin ) );
 		else if( ijv == LMARK_V ) ijv = iin - lres_vmp( iin, jin );
 #endif
+		(void)kb;
 		if( ijv >= warpbase )
 		{
 //			fprintf( stderr, "WARP!\n" );
@@ -249,7 +259,11 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
 		if( iin <= 0 || jin <= 0 ) break;
 		*--mseq1[0] = seq1[0][ifi];
 		*--mseq2[0] = seq2[0][jfi];
+#if defined(MAFFT_AVX512)
+		if( kb ? kb_isstop( ifi, jfi ) : ijp[ifi][jfi] == localstop ) break;
+#else
 		if( ijp[ifi][jfi] == localstop ) break;
+#endif
 		k++;
 		iin = ifi; jin = jfi;
 	}
@@ -265,6 +279,49 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
 	return( 0.0 );
 }
 
+
+/*
+ * The preconditions of the integer fills (Lfill_int, Lfill_kb), shared by all of them: every score
+ * and penalty integral and small enough that no intermediate comes near int32 overflow.  Sets
+ * *ithrpt and used[c] (character c occurs in s1 or s2).  Returns 0 when the double-precision fill
+ * must be used instead.
+ */
+static int lfill_prepare( double **amino_dynamicmtx, double **n_dynamicmtx, double scoreoffset,
+                          unsigned char *u1, unsigned char *u2, int lgth1, int lgth2, int *ithrpt, unsigned char *used )
+{
+	int i, j, c, k, maxabs = 0, ithr;
+	int pen = penalty, ext = penalty_ex;
+	double thr = -offset + scoreoffset * 600;
+	if( lgth1 < 1 || lgth2 < 1 ) return( 0 );
+	if( thr != (double)(int)thr ) return( 0 );
+	ithr = (int)thr;
+	for( i=0; i<nalphabets; i++ ) for( j=0; j<nalphabets; j++ )
+	{
+		double v = n_dynamicmtx[i][j];
+		if( v != (double)(int)v ) return( 0 );
+		if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
+	}
+	/* Characters outside the alphabet read entries that were never set from n_dynamicmtx. */
+	memset( used, 0, 0x100 );
+	for( i=0; i<lgth1; i++ ) used[u1[i]] = 1;
+	for( j=0; j<lgth2; j++ ) used[u2[j]] = 1;
+	for( c=0; c<0x100; c++ ) if( used[c] )
+	{
+		for( k=0; k<0x100; k++ ) if( used[k] )
+		{
+			double v = amino_dynamicmtx[c][k];
+			if( v != (double)(int)v || fabs( v ) > 1e6 ) return( 0 );
+			if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
+		}
+	}
+	/* Keep every intermediate (including prev[k] - k*ext) far from int32 overflow. */
+	{
+		double bound = (double)( maxabs + abs( pen ) + abs( ext ) + abs( ithr ) + 1 ) * ( lgth1 + lgth2 + 4 ) * 2.0;
+		if( bound > 5.0e8 ) return( 0 );
+	}
+	*ithrpt = ithr;
+	return( 1 );
+}
 
 /*
  * Integer version of the L__align11 fill (trywarp == 0 only).
@@ -295,13 +352,13 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
                       char *s1, char *s2, int lgth1, int lgth2, int **ijp, int lstop,
                       double *maxwmpt, int *endalipt, int *endaljpt )
 {
-	int i, j, c, k, maxabs = 0;
+	int i, j, c, k;
 	int pen = penalty, ext = penalty_ex;
-	double thr = -offset + scoreoffset * 600;
 	int ithr, *prof[0x100], *profbuf, nprof = 0;
 	int *prev, *cur, *vm, *hq, *wmrow, *vmraw;
+	int needwm, endpend = 0;
 #if defined(MAFFT_A64)
-	int *kx, *kp, needwm, endpend = 0;
+	int *kx, *kp;
 #endif
 #if defined(MAFFT_SVE)
 	/* lsve_nstep: 0 (use NEON), else the log2 of the lanes per SVE vector (2..4 handled) */
@@ -313,33 +370,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 	unsigned char used[0x100];
 	size_t need;
 
-	if( lgth1 < 1 || lgth2 < 1 ) return( 0 );
-	if( thr != (double)(int)thr ) return( 0 );
-	ithr = (int)thr;
-	for( i=0; i<nalphabets; i++ ) for( j=0; j<nalphabets; j++ )
-	{
-		double v = n_dynamicmtx[i][j];
-		if( v != (double)(int)v ) return( 0 );
-		if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
-	}
-	/* Characters outside the alphabet read entries that were never set from n_dynamicmtx. */
-	memset( used, 0, sizeof( used ) );
-	for( i=0; i<lgth1; i++ ) used[u1[i]] = 1;
-	for( j=0; j<lgth2; j++ ) used[u2[j]] = 1;
-	for( c=0; c<0x100; c++ ) if( used[c] )
-	{
-		for( k=0; k<0x100; k++ ) if( used[k] )
-		{
-			double v = amino_dynamicmtx[c][k];
-			if( v != (double)(int)v || fabs( v ) > 1e6 ) return( 0 );
-			if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
-		}
-	}
-	/* Keep every intermediate (including prev[k] - k*ext) far from int32 overflow. */
-	{
-		double bound = (double)( maxabs + abs( pen ) + abs( ext ) + abs( ithr ) + 1 ) * ( lgth1 + lgth2 + 4 ) * 2.0;
-		if( bound > 5.0e8 ) return( 0 );
-	}
+	if( !lfill_prepare( amino_dynamicmtx, n_dynamicmtx, scoreoffset, u1, u2, lgth1, lgth2, &ithr, used ) ) return( 0 );
 
 	for( c=0; c<0x100; c++ ) prof[c] = NULL;
 	for( c=0; c<0x100; c++ ) if( used[c] ) nprof++;
@@ -416,12 +447,12 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		rowmax = INT_MIN;
 		if( !profrow ) profrow = prof[u1[0]]; /* last row: cur[] is never read again */
 		j = 1;
-#if defined(MAFFT_A64)
 		/* Once maxwm > ithr, a row whose maximum beats it has rowmax > ithr, and its first cell
 		   holding rowmax is the first j with cur[j] - profrow[j] == rowmax (a clamped cell gives
 		   ithr there, below rowmax; any other gives its wm).  The vector loops then skip wmrow,
 		   and the search is done once, after the last row, on the row that set maxwm. */
 		needwm = ( maxwm <= ithr );
+#if defined(MAFFT_A64)
 		if( lgth2 >= 7 )
 		{
 			/* Cells 1..3 in scalar code (the same rules as the remaining cells below), so that the
@@ -610,7 +641,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 				cvt = _mm256_cmpgt_epi32( g, wm );
 				wm = _mm256_max_epi32( wm, g );
 				_mm256_store_si256( (__m256i *)( vm + j ), _mm256_add_epi32( _mm256_max_epi32( p, vmj ), vext ) );
-				_mm256_storeu_si256( (__m256i *)( wmrow + j ), wm );
+				if( needwm ) _mm256_storeu_si256( (__m256i *)( wmrow + j ), wm );
 				vmax = _mm256_max_epi32( vmax, wm );
 				clamp = _mm256_cmpgt_epi32( vthr, wm );
 				ij = _mm256_and_si256( ch, vmarkh );
@@ -658,17 +689,14 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 			ijrow[j] = ij;
 			cur[j] = wm + profrow[j];
 		}
-#if defined(MAFFT_A64)
 		if( rowmax > maxwm && !needwm )
 		{
 			maxwm = rowmax; endali = i; endpend = 1;
 		}
-		else
-#endif
-		if( rowmax > maxwm )
+		else if( rowmax > maxwm )
 		{
-#if defined(MAFFT_A64)
 			endpend = 0;
+#if defined(MAFFT_A64)
 			/* first cell holding rowmax (it is always present): 16 cells per test, then 4 */
 			int32x4_t vr = vdupq_n_s32( rowmax );
 			j = 1;
@@ -694,7 +722,6 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		if( i < lgth1 ) cur[0] = (int)amino_dynamicmtx[u2[0]][u1[i]]; /* currentw[0] = initverticalw[i] */
 	}
 
-#if defined(MAFFT_A64)
 	if( endpend )
 	{
 		int *r = LROW( endali ), *pr = ( endali < lgth1 ) ? prof[u1[endali]] : prof[u1[0]];
@@ -702,7 +729,6 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 			;
 		endalj = j;
 	}
-#endif
 	free( profbuf ); free( vmraw ); free( hq ); free( wmrow );
 #if defined(MAFFT_A64)
 	free( kx );
@@ -712,7 +738,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 	*endaljpt = endalj;
 	return( 1 );
 }
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 /*
  * Lfill_kb: the marker fill above in a striped layout (Farrar's), with ijp kept as one byte per
  * cell (0 diagonal, KB_H for LMARK_H, KB_V for LMARK_V, KB_STOP for lstop) instead of an int.
@@ -731,7 +757,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
  * value for column c, i.e. prev[c] as row i+1 reads it, at KB_RV( i, c )) for the marker replay,
  * which kb_hk() and kb_vmp() do exactly as lres_hk() and lres_vmp() do over Lfill_int's rows.
  * The first cell holding a row's maximum is the first position holding it in the lowest lane
- * that has it (lanes are in column order).  Ltracking_kb() is Ltracking() reading kb_ijv().
+ * that has it (lanes are in column order).  Ltracking() reads the traceback through kb_ijv().
  */
 /* 64-byte aligned allocation, released with aligned_free_64() */
 static void *aligned_alloc_64( size_t n )
@@ -759,9 +785,8 @@ static int Lfill_kb( double **amino_dynamicmtx, double **n_dynamicmtx, double sc
                      char *s1, char *s2, int lgth1, int lgth2,
                      double *maxwmpt, int *endalipt, int *endaljpt )
 {
-	int i, j, c, k, l, s, S, maxabs = 0;
+	int i, c, k, l, s, S;
 	int pen = penalty, ext = penalty_ex;
-	double thr = -offset + scoreoffset * 600;
 	int ithr, *prof[0x100], *profbuf, nprof = 0, *vmraw, *vm, *wmrow;
 	int maxwm, endali = 0, endalj = 0, rowmax;
 	unsigned char *u1 = (unsigned char *)s1, *u2 = (unsigned char *)s2;
@@ -769,31 +794,7 @@ static int Lfill_kb( double **amino_dynamicmtx, double **n_dynamicmtx, double sc
 	size_t need, needkb, rs;
 	__m512i lanebase, ltn;
 
-	if( lgth1 < 1 || lgth2 < 1 ) return( 0 );
-	if( thr != (double)(int)thr ) return( 0 );
-	ithr = (int)thr;
-	for( i=0; i<nalphabets; i++ ) for( j=0; j<nalphabets; j++ )
-	{
-		double v = n_dynamicmtx[i][j];
-		if( v != (double)(int)v ) return( 0 );
-		if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
-	}
-	memset( used, 0, sizeof( used ) );
-	for( i=0; i<lgth1; i++ ) used[u1[i]] = 1;
-	for( j=0; j<lgth2; j++ ) used[u2[j]] = 1;
-	for( c=0; c<0x100; c++ ) if( used[c] )
-	{
-		for( k=0; k<0x100; k++ ) if( used[k] )
-		{
-			double v = amino_dynamicmtx[c][k];
-			if( v != (double)(int)v || fabs( v ) > 1e6 ) return( 0 );
-			if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
-		}
-	}
-	{
-		double bound = (double)( maxabs + abs( pen ) + abs( ext ) + abs( ithr ) + 1 ) * ( lgth1 + lgth2 + 4 ) * 2.0;
-		if( bound > 5.0e8 ) return( 0 );
-	}
+	if( !lfill_prepare( amino_dynamicmtx, n_dynamicmtx, scoreoffset, u1, u2, lgth1, lgth2, &ithr, used ) ) return( 0 );
 
 	S = kb_S = ( lgth2 + 15 ) / 16;
 	rs = KB_RSTRIDE;
@@ -990,100 +991,15 @@ static int kb_ijv( int i, int j, int lstop )
 		default: return( 0 );
 	}
 }
-#define KB_ISSTOP( i, j ) ( ( i ) <= 0 || ( j ) <= 0 || KB_KIND( i, ( j )-1 ) == KB_STOP )
-
-static void Ltracking_kb( char **seq1, char **seq2, char **mseq1, char **mseq2,
-                            int *off1pt, int *off2pt, int endi, int endj, int lstop,
-                            int *warpis, int *warpjs, int warpbase )
-{
-	int l, iin, jin, lgth1, lgth2, k, limk;
-	int ifi=0, jfi=0;
-	char *gap = newgapstr;
-	lgth1 = strlen( seq1[0] );
-	lgth2 = strlen( seq2[0] );
-
-	mseq1[0] += lgth1+lgth2;
-	*mseq1[0] = 0;
-	mseq2[0] += lgth1+lgth2;
-	*mseq2[0] = 0;
-	iin = endi; jin = endj;
-	limk = lgth1+lgth2;
-	for( k=0; k<=limk; k++ )
-	{
-		int ijv = kb_ijv( iin, jin, lstop );
-		if( ijv >= warpbase )
-		{
-			ifi = warpis[ijv-warpbase];
-			jfi = warpjs[ijv-warpbase];
-		}
-		else if( ijv < 0 )
-		{
-			ifi = iin-1; jfi = jin+ijv;
-		}
-		else if( ijv > 0 )
-		{
-			ifi = iin-ijv; jfi = jin-1;
-		}
-		else
-		{
-			ifi = iin-1; jfi = jin-1;
-		}
-
-		if( ifi == -warpbase && jfi == -warpbase )
-		{
-			l = iin;
-			while( --l >= 0 )
-			{
-				*--mseq1[0] = seq1[0][l];
-				*--mseq2[0] = *gap;
-				k++;
-			}
-			l= jin;
-			while( --l >= 0 )
-			{
-				*--mseq1[0] = *gap;
-				*--mseq2[0] = seq2[0][l];
-				k++;
-			}
-			break;
-		}
-		else
-		{
-			l = iin - ifi;
-			while( --l > 0 )
-			{
-				*--mseq1[0] = seq1[0][ifi+l];
-				*--mseq2[0] = *gap;
-				k++;
-			}
-			l= jin - jfi;
-			while( --l > 0 )
-			{
-				*--mseq1[0] = *gap;
-				*--mseq2[0] = seq2[0][jfi+l];
-				k++;
-			}
-		}
-
-		if( iin <= 0 || jin <= 0 ) break;
-		*--mseq1[0] = seq1[0][ifi];
-		*--mseq2[0] = seq2[0][jfi];
-		if( KB_ISSTOP( ifi, jfi ) ) break;
-		k++;
-		iin = ifi; jin = jfi;
-	}
-	if( ifi == -1 ) *off1pt = 0; else *off1pt = ifi;
-	if( jfi == -1 ) *off2pt = 0; else *off2pt = jfi;
-}
+static int kb_isstop( int i, int j ) { return( i <= 0 || j <= 0 || KB_KIND( i, j-1 ) == KB_STOP ); }
 #endif
 #else
 static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double scoreoffset,
                       char *s1, char *s2, int lgth1, int lgth2, int **ijp, int lstop,
                       double *maxwmpt, int *endalipt, int *endaljpt )
 {
-	int i, j, c, k, maxabs = 0, ok = 1;
+	int i, j, c, k;
 	int pen = penalty, ext = penalty_ex;
-	double thr = -offset + scoreoffset * 600;
 	int ithr, *prof[0x100], *profbuf, nprof = 0;
 	int *prev, *cur, *vm, *vmp, *hq, *hk, *wmrow, *pbuf1, *pbuf2;
 	int tbest, tbestk, jj;
@@ -1091,33 +1007,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 	unsigned char *u1 = (unsigned char *)s1, *u2 = (unsigned char *)s2;
 	unsigned char used[0x100];
 
-	if( lgth1 < 1 || lgth2 < 1 ) return( 0 );
-	if( thr != (double)(int)thr ) return( 0 );
-	ithr = (int)thr;
-	for( i=0; i<nalphabets; i++ ) for( j=0; j<nalphabets; j++ )
-	{
-		double v = n_dynamicmtx[i][j];
-		if( v != (double)(int)v ) return( 0 );
-		if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
-	}
-	/* Characters outside the alphabet read entries that were never set from n_dynamicmtx. */
-	memset( used, 0, sizeof( used ) );
-	for( i=0; i<lgth1; i++ ) used[u1[i]] = 1;
-	for( j=0; j<lgth2; j++ ) used[u2[j]] = 1;
-	for( c=0; c<0x100; c++ ) if( used[c] )
-	{
-		for( k=0; k<0x100; k++ ) if( used[k] )
-		{
-			double v = amino_dynamicmtx[c][k];
-			if( v != (double)(int)v || fabs( v ) > 1e6 ) return( 0 );
-			if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
-		}
-	}
-	/* Keep every intermediate (including prev[k] - k*ext) far from int32 overflow. */
-	{
-		double bound = (double)( maxabs + abs( pen ) + abs( ext ) + abs( ithr ) + 1 ) * ( lgth1 + lgth2 + 4 ) * 2.0;
-		if( bound > 5.0e8 ) return( 0 );
-	}
+	if( !lfill_prepare( amino_dynamicmtx, n_dynamicmtx, scoreoffset, u1, u2, lgth1, lgth2, &ithr, used ) ) return( 0 );
 
 	for( c=0; c<0x100; c++ ) prof[c] = NULL;
 	for( c=0; c<0x100; c++ ) if( used[c] ) nprof++;
@@ -1341,7 +1231,7 @@ double L__align11( double **n_dynamicmtx, double scoreoffset, char **seq1, char 
 	double *prevwmrecords = NULL;
 	int warpn = 0;
 	int warpbase;
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 	int kbfill = 0;
 #endif
 	double curm = 0.0;
@@ -1496,7 +1386,7 @@ double L__align11( double **n_dynamicmtx, double scoreoffset, char **seq1, char 
 	}
 	ijp = commonIP;
 
-#if defined(MAFFT_AVX512X)
+#if defined(MAFFT_AVX512)
 	if( !trywarp )
 	{
 		localstop = lgth1+lgth2+1;
@@ -1810,8 +1700,8 @@ fprintf( stderr, "\n" );
 #endif
 
 Lint_done:
-#if defined(MAFFT_AVX512X)
-	if( kbfill ? KB_ISSTOP( endali, endalj ) : ( ijp[endali][endalj] == localstop ) )
+#if defined(MAFFT_AVX512)
+	if( kbfill ? kb_isstop( endali, endalj ) : ( ijp[endali][endalj] == localstop ) )
 #else
 	if( ijp[endali][endalj] == localstop )
 #endif
@@ -1823,12 +1713,11 @@ Lint_done:
 		return( 0.0 );
 	}
 		
-#if defined(MAFFT_AVX512X)
-	if( kbfill )
-		Ltracking_kb( seq1, seq2, mseq1, mseq2, off1pt, off2pt, endali, endalj, localstop, warpis, warpjs, warpbase );
-	else
+#if defined(MAFFT_AVX512)
+	Ltracking( currentw, lastverticalw, seq1, seq2, mseq1, mseq2, ijp, off1pt, off2pt, endali, endalj, warpis, warpjs, warpbase, kbfill );
+#else
+	Ltracking( currentw, lastverticalw, seq1, seq2, mseq1, mseq2, ijp, off1pt, off2pt, endali, endalj, warpis, warpjs, warpbase, 0 );
 #endif
-	Ltracking( currentw, lastverticalw, seq1, seq2, mseq1, mseq2, ijp, off1pt, off2pt, endali, endalj, warpis, warpjs, warpbase );
 	if( warpis ) free( warpis );
 	if( warpjs ) free( warpjs );
 
