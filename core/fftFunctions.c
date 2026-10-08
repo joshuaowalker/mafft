@@ -2,6 +2,61 @@
 #if defined(__AVX512BW__) && !defined(__ARM_NEON)
 #include <immintrin.h>
 #endif
+#if defined(__ARM_NEON) && !defined(__APPLE__)
+#include <arm_neon.h>
+/* One bit (bit 4t) per byte t of x that differs from every byte of the masks OR-ed into eq. */
+#define NEON_NIBBLES( eq ) ( ~vget_lane_u64( vreinterpret_u64_u8( vshrn_n_u16( vreinterpretq_u16_u8( eq ), 4 ) ), 0 ) & 0x1111111111111111ULL )
+/*
+ * alignableReagion's column profiles when the gap has a bin (DNA): built bin-major in a scratch
+ * buffer, where one row's 16 consecutive gap columns are 16 consecutive doubles of the gap bin
+ * (one vector add each pair), then transposed into cp[i*nu+bin].  Every bin receives the same
+ * additions in the same order (rows in order, one add per row), so cp is bit-identical.
+ */
+static int areg_binmajor( char **seq1, char **seq2, int clus1, int clus2, double *eff1, double *eff2, int len, int nu, int *cidx, double *cp1, double *cp2 )
+{
+	static TLS double *t = NULL;
+	static TLS size_t tcap = 0;
+	int side, j, i, a, gb = cidx['-'];
+	const uint8x16_t dash = vdupq_n_u8( '-' );
+	if( tcap < (size_t)len * nu )
+	{
+		free( t );
+		tcap = (size_t)len * nu;
+		t = malloc( sizeof( double ) * tcap );
+		if( !t ) { tcap = 0; return( 0 ); }
+	}
+	for( side=0; side<2; side++ )
+	{
+		int nrow = side ? clus2 : clus1;
+		char **seq = side ? seq2 : seq1;
+		double *eff = side ? eff2 : eff1, *cp = side ? cp2 : cp1, *tg = t + (size_t)gb * len;
+		memset( t, 0, sizeof( double ) * (size_t)len * nu );
+		for( j=0; j<nrow; j++ )
+		{
+			unsigned char *s = (unsigned char *)seq[j];
+			double e = eff[j];
+			float64x2_t ve = vdupq_n_f64( e );
+			for( i=0; i+16<=len; i+=16 )
+			{
+				uint8x16_t g = vceqq_u8( vld1q_u8( s + i ), dash );
+				if( vminvq_u8( g ) )
+				{
+					int q;
+					for( q=0; q<16; q+=2 ) vst1q_f64( tg + i + q, vaddq_f64( vld1q_f64( tg + i + q ), ve ) );
+				}
+				else
+				{
+					int q;
+					for( q=i; q<i+16; q++ ) { int ci = cidx[s[q]]; if( ci >= 0 ) t[(size_t)ci*len+q] += e; }
+				}
+			}
+			for( ; i<len; i++ ) { int ci = cidx[s[i]]; if( ci >= 0 ) t[(size_t)ci*len+i] += e; }
+		}
+		for( i=0; i<len; i++ ) for( a=0; a<nu; a++ ) cp[(size_t)i*nu+a] = t[(size_t)a*len+i];
+	}
+	return( 1 );
+}
+#endif
 
 #define SEGMENTSIZE 150
 #define TMPTMPTMP 0
@@ -279,6 +334,28 @@ int alignableReagion( int    clus1, int    clus2,
 				for( ; i<len; i++ ) seenc[s[i]] = 1;
 			}
 		}
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+		/* The AVX-512BW block above, 16 bytes at a time (Linux arm64). */
+		{
+			static const unsigned char common[] = "-acgtACGT";
+			uint8x16_t cv[9];
+			int nc = 0, q;
+			for( q=0; common[q]; q++ )
+				if( amino_n[common[q]] >= 0 && amino_n[common[q]] < nalphabets ) { seenc[common[q]] = 1; cv[nc++] = vdupq_n_u8( common[q] ); }
+			for( j=0; j<clus1+clus2; j++ )
+			{
+				unsigned char *s = (unsigned char *)( j < clus1 ? seq1[j] : seq2[j-clus1] );
+				for( i=0; i+16<=len; i+=16 )
+				{
+					uint8x16_t x = vld1q_u8( s + i ), eq = vdupq_n_u8( 0 );
+					unsigned long long m;
+					for( q=0; q<nc; q++ ) eq = vorrq_u8( eq, vceqq_u8( x, cv[q] ) );
+					m = NEON_NIBBLES( eq );
+					while( m ) { seenc[s[i+( __builtin_ctzll( m ) >> 2 )]] = 1; m &= m - 1; }
+				}
+				for( ; i<len; i++ ) seenc[s[i]] = 1;
+			}
+		}
 #else
 		for( j=0; j<clus1; j++ ) { unsigned char *s = (unsigned char *)seq1[j]; for( i=0; i<len; i++ ) seenc[s[i]] = 1; }
 		for( j=0; j<clus2; j++ ) { unsigned char *s = (unsigned char *)seq2[j]; for( i=0; i<len; i++ ) seenc[s[i]] = 1; }
@@ -372,6 +449,26 @@ int alignableReagion( int    clus1, int    clus2,
 				for( ; i<len; i++ ) { int ci = cidx[s[i]]; if( ci >= 0 ) cp[i*nu+ci] += e; }
 			}
 			if( cidx['-'] >= 0 )
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+			/* the same adds in the same order, visiting only the non-gap bytes (when '-' has no bin) */
+			for( j=0; j<clus1+clus2 && cidx['-'] < 0; j++ )
+			{
+				unsigned char *s = (unsigned char *)( j < clus1 ? seq1[j] : seq2[j-clus1] );
+				double e = ( j < clus1 ) ? eff1[j] : eff2[j-clus1], *cp = ( j < clus1 ) ? cp1 : cp2;
+				uint8x16_t dash = vdupq_n_u8( '-' );
+				for( i=0; i+16<=len; i+=16 )
+				{
+					unsigned long long m = NEON_NIBBLES( vceqq_u8( vld1q_u8( s + i ), dash ) );
+					while( m )
+					{
+						int ii = i + ( __builtin_ctzll( m ) >> 2 ), ci = cidx[s[ii]];
+						if( ci >= 0 ) cp[ii*nu+ci] += e;
+						m &= m - 1;
+					}
+				}
+				for( ; i<len; i++ ) { int ci = cidx[s[i]]; if( ci >= 0 ) cp[i*nu+ci] += e; }
+			}
+			if( cidx['-'] >= 0 && !areg_binmajor( seq1, seq2, clus1, clus2, eff1, eff2, len, nu, cidx, cp1, cp2 ) )
 #endif
 			{
 			for( j=0; j<clus1; j++ ) { unsigned char *s = (unsigned char *)seq1[j]; double e = eff1[j]; for( i=0; i<len; i++ ) { int ci = cidx[s[i]]; if( ci >= 0 ) cp1[i*nu+ci] += e; } }

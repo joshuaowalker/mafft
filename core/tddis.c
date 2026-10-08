@@ -1,6 +1,8 @@
 #include "mltaln.h"
 #if defined(MAFFT_AVX512X)
 #include <immintrin.h>
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#include <arm_neon.h>
 #endif
 
 #define DEBUG 0
@@ -232,6 +234,34 @@ void cpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus )
 	(void)seqpt;
 }
 #else
+#if defined(__ARM_NEON) && !defined(__APPLE__)
+	/* 16 columns at a time where they are all gaps: one row of cpmx, 8 vector adds.  Each
+	   element receives the same additions in the same order (Linux arm64). */
+	{
+		const uint8x16_t dash = vdupq_n_u8( '-' );
+		for( k=0; k<clus; k++ )
+		{
+			float64x2_t ve;
+			feff = (double)eff[k];
+			ve = vdupq_n_f64( feff );
+			seqpt = seq[k];
+			for( j=0; j+16<=lgth; j+=16 )
+			{
+				if( vminvq_u8( vceqq_u8( vld1q_u8( (unsigned char *)seqpt + j ), dash ) ) )
+				{
+					double *cg = cpmx[(unsigned char)amino_n['-']];
+					for( i=0; i<16; i+=2 ) vst1q_f64( cg + j + i, vaddq_f64( vld1q_f64( cg + j + i ), ve ) );
+				}
+				else
+				{
+					for( i=j; i<j+16; i++ ) cpmx[(unsigned char)amino_n[(unsigned char)seqpt[i]]][i] += feff;
+				}
+			}
+			for( ; j<lgth; j++ ) cpmx[(unsigned char)amino_n[(unsigned char)seqpt[j]]][j] += feff;
+		}
+		return;
+	}
+#endif
 	for( k=0; k<clus; k++ )
 	{
 		feff = (double)eff[k];
