@@ -7,7 +7,8 @@ p = os.path.join(sys.argv[1], 'fftFunctions.c')
 s = open(p, encoding='latin-1').read()
 sig = 'int alignableReagion( int    clus1, int    clus2, '
 assert s.count(sig) == 1
-s = s.replace(sig, 'static int ar_vec = 1;\nstatic int alignableReagion_impl( int    clus1, int    clus2, ')
+s = s.replace(sig, 'static int alignableReagion_impl( int    clus1, int    clus2, ')
+s = s.replace('#include "mltaln.h"\n', '#include "mltaln.h"\nstatic int ar_vec = 1;\n', 1)
 n = 0
 for pat in ('for( i=0; i+64<=len; i+=64 )', 'for( i=0; i+16<=len; i+=16 )', 'for( q=0; common[q]; q++ )'):
     n += s.count(pat)
@@ -15,7 +16,7 @@ for pat, rep in (('for( i=0; i+64<=len; i+=64 )', 'for( i=0; ar_vec && i+64<=len
                  ('for( i=0; i+16<=len; i+=16 )', 'for( i=0; ar_vec && i+16<=len; i+=16 )'),
                  ('for( q=0; common[q]; q++ )', 'for( q=0; ar_vec && common[q]; q++ )')):
     s = s.replace(pat, rep)
-assert n == 6, n
+assert n == 7, n
 wrapper = r'''
 int alignableReagion( int clus1, int clus2, char **seq1, char **seq2, double *eff1, double *eff2, Segment *seg )
 {
