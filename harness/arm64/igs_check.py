@@ -20,7 +20,8 @@ static int igs_pairscores( char **seq1, char **seq2, int clus1, int clus2, int l
 	if( r1 ) for( k=0; k<clus1*clus2; k++ ) if( memcmp( o0+k, out+k, sizeof( double ) ) ) { fprintf( stderr, "IGS_CHECK: pair %d\n", k ); abort(); }
 	free( o0 );
 	cells += (long)clus1 * clus2;
-	if( ( ++calls & ( calls - 1 ) ) == 0 ) fprintf( stderr, "IGS_CHECK: %ld calls, %ld pairs, all identical\n", calls, cells );
+	calls++;
+	if( ( calls & ( calls - 1 ) ) == 0 ) fprintf( stderr, "IGS_CHECK: %ld calls, %ld pairs, all identical\n", calls, cells );
 	return( r1 );
 }
 '''

@@ -16,7 +16,7 @@ for fname, fn, gf in (('partSalignmm.c', 'partA_row', 'gapfreq2'), ('Salignmm.c'
     sig = s[sig_start:sig_end]
     s = s[:sig_start] + 'static int %s_vec = 1;\n' % fn + sig.replace('static void %s(' % fn, 'static void %s_impl(' % fn) + s[sig_end:]
     n = 0
-    for pat in ('for( ; j+1<=lgth2; j+=2 )', 'for( ; j+7<=lgth2; j+=8 )', 'for( ; j+8<=lgth2; j+=8 )', 'for( ; j+2<=lgth2; j+=2 )', 'for( ; j+3<=lgth2; j+=4 )', 'for( ; j+4<=lgth2; j+=4 )'):
+    for pat in ('for( ; j+1<=lgth2; j+=2 )', 'for( ; j+7<=lgth2; j+=8 )', 'for( ; j+8<=lgth2; j+=8 )', 'for( ; j+2<=lgth2; j+=2 )', 'for( ; j+3<=lgth2; j+=4 )'):
         n += s.count(pat)
         s = s.replace(pat, pat.replace('for( ; ', 'for( ; %s_vec && ' % fn))
     assert n >= 1, (fname, n)

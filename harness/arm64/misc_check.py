@@ -24,7 +24,8 @@ s = s[:j] + r'''static int makeresmap( char *seq, int *map )
 	n1 = makeresmap_impl( seq, map );
 	if( n0 != n1 || memcmp( m0, map, sizeof( int ) * n0 ) ) { fprintf( stderr, "RESMAP_CHECK: differs\n" ); abort(); }
 	free( m0 );
-	if( ( ++calls & ( calls - 1 ) ) == 0 ) fprintf( stderr, "RESMAP_CHECK: %ld calls, all identical\n", calls );
+	calls++;
+	if( ( calls & ( calls - 1 ) ) == 0 ) fprintf( stderr, "RESMAP_CHECK: %ld calls, all identical\n", calls );
 	return( n1 );
 }
 ''' + s[j:]
@@ -47,7 +48,8 @@ s = s[:j] + r'''static void part_imp_match_out_vead_gapmap( double *imp, int i1,
 	if( memcmp( c0, imp, sizeof( double ) * lgth2 ) ) { fprintf( stderr, "VEAD_CHECK: differs\n" ); abort(); }
 	free( c0 );
 	cells += lgth2;
-	if( ( ++calls & ( calls - 1 ) ) == 0 ) fprintf( stderr, "VEAD_CHECK: %ld calls, %ld cells, all identical\n", calls, cells );
+	calls++;
+	if( ( calls & ( calls - 1 ) ) == 0 ) fprintf( stderr, "VEAD_CHECK: %ld calls, %ld cells, all identical\n", calls, cells );
 }
 ''' + s[j:]
 open(p, 'w', encoding='latin-1').write(s)
