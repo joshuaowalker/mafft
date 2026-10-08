@@ -2,6 +2,10 @@
 #if defined(__AVX512F__) && !defined(__ARM_NEON)
 #include <immintrin.h>
 #endif
+#if defined(__ARM_NEON) && !defined(__APPLE__)
+#include <arm_neon.h>
+#define IGS_NEON 1 /* Linux arm64: NEON igs_prep and table-lookup column sums (no Accelerate) */
+#endif
 
 #define DEBUG 0
 #define CANONICALTREEFORMAT 1
@@ -529,12 +533,169 @@ static double *igs_colsums( char **seq1, char **seq2, int clus1, int clus2, int 
 #endif
 }
 
+#ifdef IGS_NEON
+static int igs_vec = 1;
+/*
+ * igs_prep() below, 16 columns at a time where they are all gaps or all residues (the rows are
+ * ~70% gaps, in long runs), the original per-column steps elsewhere.  The same right-to-left
+ * walk, so nxt[], the runs and the return value are identical.
+ */
+static int igs_prep_neon( char *seq, int len, int *nxt, igs_run *runs, int *nrun )
+{
+	int k, n = 0, inrun = 0, i0 = len & ~15;
+	unsigned char c, *u = (unsigned char *)seq;
+	const uint8x16_t dash = vdupq_n_u8( '-' );
+	const int32x4_t four = vdupq_n_s32( 4 );
+	if( seq[len] != 0 ) return( 0 );
+	nxt[len] = len;
+#define IGS_PREP_STEP( K ) \
+	{ \
+		c = u[K]; \
+		if( c == 0 || c >= 0x80 ) return( 0 ); \
+		if( c == '-' ) \
+		{ \
+			nxt[K] = nxt[K+1]; \
+			if( !inrun ) { runs[n].e = K; inrun = 1; } \
+			runs[n].s = K; \
+		} \
+		else \
+		{ \
+			nxt[K] = K; \
+			if( inrun ) { n++; inrun = 0; } \
+		} \
+	}
+	for( k=len-1; k>=i0; k-- ) IGS_PREP_STEP( k )
+	for( ; k>=0; k-=16 )
+	{
+		int i = k - 15;
+		uint8x16_t x = vld1q_u8( u + i );
+		uint8x16_t g = vceqq_u8( x, dash );
+		if( vminvq_u8( x ) == 0 || vmaxvq_u8( x ) >= 0x80 ) return( 0 );
+		if( vminvq_u8( g ) )        /* all gaps */
+		{
+			int32x4_t v = vdupq_n_s32( nxt[i+16] );
+			vst1q_s32( nxt + i, v ); vst1q_s32( nxt + i + 4, v ); vst1q_s32( nxt + i + 8, v ); vst1q_s32( nxt + i + 12, v );
+			if( !inrun ) { runs[n].e = i + 15; inrun = 1; }
+			runs[n].s = i;
+		}
+		else if( !vmaxvq_u8( g ) )  /* no gaps */
+		{
+			int32x4_t v = { i, i+1, i+2, i+3 };
+			vst1q_s32( nxt + i, v ); v = vaddq_s32( v, four );
+			vst1q_s32( nxt + i + 4, v ); v = vaddq_s32( v, four );
+			vst1q_s32( nxt + i + 8, v ); v = vaddq_s32( v, four );
+			vst1q_s32( nxt + i + 12, v );
+			if( inrun ) { n++; inrun = 0; }
+		}
+		else
+		{
+			int kk;
+			for( kk=k; kk>=i; kk-- ) IGS_PREP_STEP( kk )
+		}
+	}
+#undef IGS_PREP_STEP
+	if( inrun ) n++;
+	for( k=0; k<n/2; k++ ) { igs_run t = runs[k]; runs[k] = runs[n-1-k]; runs[n-1-k] = t; }
+	*nrun = n;
+	return( 1 );
+}
+
+/*
+ * The per-pair int32 column sums, by table lookup.  Up to 7 characters (gaps included) get
+ * codes 0..6 and all others code 7; column k's score D[a][b] is entry
+ * code(a)*8 + code(b) of a 64-entry int16 table (0 where either code is 7), looked up 16
+ * columns at a time with tbl (low and high bytes separately).  The columns where either row
+ * has a code-7 character are then added from D directly (each row keeps a list of them).
+ * Integer sums: exact in any order, and equal to the scalar loop's.  Returns NULL (nothing
+ * done) when a score does not fit int16.
+ */
+static double *igs_colsums_neon( char **seq1, char **seq2, int clus1, int clus2, int len, int *dzi )
+{
+	unsigned char code[0x80], tlo[64], thi[64], *cb;
+	int i, j, k, a, b, nc = 0, nrow = clus1 + clus2, *rare, *nrare;
+	double *colsum;
+	uint8x16x4_t mlo, mhi, tl, th;
+
+	/* codes 0..6: the first 7 distinct characters of seq1[0] (on DNA: the gap, acgt, often n) */
+	memset( code, 7, sizeof( code ) );
+	{
+		unsigned char *s = (unsigned char *)seq1[0];
+		for( k=0; k<len && nc<7; k++ ) if( code[s[k]] == 7 ) code[s[k]] = nc++;
+	}
+	memset( tlo, 0, sizeof( tlo ) ); memset( thi, 0, sizeof( thi ) );
+	for( a=0; a<0x80; a++ ) if( code[a] != 7 ) for( b=0; b<0x80; b++ ) if( code[b] != 7 )
+	{
+		int v = dzi[a*0x80+b];
+		if( v < -32768 || v > 32767 ) return( NULL );
+		tlo[code[a]*8+code[b]] = (unsigned char)( v & 0xff );
+		thi[code[a]*8+code[b]] = (unsigned char)( ( v >> 8 ) & 0xff );
+	}
+	mlo = vld1q_u8_x4( code ); mhi = vld1q_u8_x4( code + 64 );
+	tl = vld1q_u8_x4( tlo ); th = vld1q_u8_x4( thi );
+	/* recode every row and list its code-7 columns */
+	cb = malloc( (size_t)nrow * ( len + 16 ) );
+	rare = malloc( sizeof( int ) * ( (size_t)nrow * len + 1 ) );
+	nrare = malloc( sizeof( int ) * ( nrow + 1 ) );
+	colsum = malloc( sizeof( double ) * clus1 * clus2 );
+	if( !cb || !rare || !nrare || !colsum ) { free( cb ); free( rare ); free( nrare ); free( colsum ); return( NULL ); }
+	nrare[0] = 0;
+	for( i=0; i<nrow; i++ )
+	{
+		unsigned char *s = (unsigned char *)( i < clus1 ? seq1[i] : seq2[i-clus1] ), *d = cb + (size_t)i * ( len + 16 );
+		int nr = nrare[i];
+		for( k=0; k+16<=len; k+=16 )
+		{
+			uint8x16_t x = vld1q_u8( s + k );
+			uint8x16_t y = vqtbx4q_u8( vqtbl4q_u8( mlo, x ), mhi, vsubq_u8( x, vdupq_n_u8( 64 ) ) );
+			vst1q_u8( d + k, y );
+			if( vmaxvq_u8( y ) == 7 )
+			{
+				int kk;
+				for( kk=k; kk<k+16; kk++ ) if( d[kk] == 7 ) rare[nr++] = kk;
+			}
+		}
+		for( ; k<len; k++ ) if( ( d[k] = code[s[k]] ) == 7 ) rare[nr++] = k;
+		nrare[i+1] = nr;
+		if( nr > ( i + 1 ) * ( len / 32 + 1 ) ) /* not DNA-like: leave it to the scalar loop */
+		{ free( cb ); free( rare ); free( nrare ); free( colsum ); return( NULL ); }
+	}
+	for( i=0; i<clus1; i++ )
+	{
+		unsigned char *c1 = cb + (size_t)i * ( len + 16 ), *m1 = (unsigned char *)seq1[i];
+		for( j=0; j<clus2; j++ )
+		{
+			unsigned char *c2 = cb + (size_t)( clus1 + j ) * ( len + 16 ), *m2 = (unsigned char *)seq2[j];
+			int32x4_t acc0 = vdupq_n_s32( 0 ), acc1 = vdupq_n_s32( 0 );
+			int sum, r;
+			for( k=0; k+16<=len; k+=16 )
+			{
+				uint8x16_t idx = vsliq_n_u8( vld1q_u8( c2 + k ), vld1q_u8( c1 + k ), 3 );
+				uint8x16_t lo = vqtbl4q_u8( tl, idx ), hi = vqtbl4q_u8( th, idx );
+				acc0 = vpadalq_s16( acc0, vreinterpretq_s16_u8( vzip1q_u8( lo, hi ) ) );
+				acc1 = vpadalq_s16( acc1, vreinterpretq_s16_u8( vzip2q_u8( lo, hi ) ) );
+			}
+			sum = vaddvq_s32( vaddq_s32( acc0, acc1 ) );
+			for( ; k<len; k++ ) if( c1[k] != 7 && c2[k] != 7 ) sum += dzi[(m1[k]<<7)|m2[k]];
+			/* columns with a code-7 character in row i, then those with one only in row j */
+			for( r=nrare[i]; r<nrare[i+1]; r++ ) { k = rare[r]; sum += dzi[(m1[k]<<7)|m2[k]]; }
+			for( r=nrare[clus1+j]; r<nrare[clus1+j+1]; r++ ) { k = rare[r]; if( c1[k] != 7 ) sum += dzi[(m1[k]<<7)|m2[k]]; }
+			colsum[i*clus2+j] = (double)sum;
+		}
+	}
+	free( cb ); free( rare ); free( nrare );
+	return( colsum );
+}
+#endif
+
 /* One pass over a gapped row: checks it is exactly len 7-bit characters, and builds
    nxt[k] (first residue column >= k, len if none) and the list of gap stretches. */
 static int igs_prep( char *seq, int len, int *nxt, igs_run *runs, int *nrun )
 {
 	int k, n = 0, inrun = 0;
 	unsigned char c;
+#ifdef IGS_NEON
+	if( igs_vec ) return( igs_prep_neon( seq, len, nxt, runs, nrun ) );
+#endif
 	if( seq[len] != 0 ) return( 0 );
 	nxt[len] = len;
 	for( k=len-1; k>=0; k-- )
@@ -617,6 +778,9 @@ static int igs_pairscores( char **seq1, char **seq2, int clus1, int clus2, int l
 
 	/* Column sums: one GEMM when both groups are big; otherwise a direct int32 sum per pair. */
 	if( MIN( clus1, clus2 ) >= 24 ) colsum = igs_colsums( seq1, seq2, clus1, clus2, len, dz );
+#ifdef IGS_NEON
+	if( igs_vec && !colsum && (double)dzmax * len < 1.0e9 ) colsum = igs_colsums_neon( seq1, seq2, clus1, clus2, len, dzi );
+#endif
 	if( !colsum && (double)dzmax * len < 1.0e9 )
 	{
 		colsum = malloc( sizeof( double ) * clus1 * clus2 );
@@ -16121,9 +16285,134 @@ static void movereg_swap( char *seq1, char *seq2, LocalHom *tmpptr, int *start1p
 static int makeresmap( char *seq, int *map )
 {
 	int n = 0, col;
+#ifdef IGS_NEON
+	/* 16 columns at a time where they are all gaps (skipped) or all residues (16 entries) */
+	int len = (int)strlen( seq );
+	const uint8x16_t dash = vdupq_n_u8( '-' );
+	const int32x4_t four = vdupq_n_s32( 4 ), step = { 0, 1, 2, 3 };
+	for( col=0; col+16<=len; col+=16 )
+	{
+		uint8x16_t g = vceqq_u8( vld1q_u8( (unsigned char *)seq + col ), dash );
+		if( vminvq_u8( g ) ) continue;
+		if( !vmaxvq_u8( g ) )
+		{
+			int32x4_t v = vaddq_s32( vdupq_n_s32( col ), step );
+			vst1q_s32( map + n, v ); v = vaddq_s32( v, four );
+			vst1q_s32( map + n + 4, v ); v = vaddq_s32( v, four );
+			vst1q_s32( map + n + 8, v ); v = vaddq_s32( v, four );
+			vst1q_s32( map + n + 12, v );
+			n += 16;
+		}
+		else
+		{
+			int c;
+			for( c=col; c<col+16; c++ ) if( seq[c] != '-' ) map[n++] = c;
+		}
+	}
+	for( ; col<len; col++ ) if( seq[col] != '-' ) map[n++] = col;
+	return( n );
+#endif
 	for( col=0; seq[col]; col++ ) if( seq[col] != '-' ) map[n++] = col;
 	return( n );
 }
+
+#if defined(__aarch64__) && !defined(__APPLE__)
+/*
+ * The segment walk of fillimp_track() in bands of FILLIMP_BAND rows of impmtx (Linux arm64).  The
+ * walk touches about 1.7 billion cells per L-INS-i shard spread over a ~32 MB matrix; Graviton's
+ * L2 (1-2 MB per core) holds a band of rows but not the matrix.  Every cell lies in exactly one
+ * band, and within a band the segments are visited in the original (i, j, segment) order, so each
+ * cell receives the same multiply-adds in the same order as in the original walk: impmtx is
+ * bit-identical, and rowlo/rowhi (minima and maxima) are too.  Each segment keeps a cursor, as its
+ * rows increase with n.  Returns 0 (nothing done) without rowlo, or when any segment is out of
+ * range (the original walk then handles the whole call).
+ */
+#ifndef FILLIMP_BAND
+#define FILLIMP_BAND 128
+#endif
+typedef struct { int *p1, *p2; int n, cur; double segimp, w; } fillimp_seg;
+static int fillimp_banded( double **impmtx, int clus1, int clus2, int lgth1, double *eff1, double *eff2, double *eff1_kozo, double *eff2_kozo, double effijx, LocalHom ***localhom, char *swaplist, int *orinum1, int *orinum2, int *rowlo, int *rowhi, int **map1, int **map2, int *nres1, int *nres2 )
+{
+	int i, j, k, b, n, nseg = 0, nband, nlist, s1, e1, s2, e2, swap;
+	int *bstart, *bfill, *blist;
+	double effij, effij_kozo;
+	fillimp_seg *seg;
+	LocalHom *tmpptr;
+
+	if( !rowlo || lgth1 < 1 ) return( 0 );
+	for( i=0; i<clus1; i++ )
+	{
+		swap = ( swaplist && swaplist[i] );
+		for( j=0; j<clus2; j++ )
+		{
+			if( swaplist == NULL && orinum1 && orinum2 ) swap = ( orinum1[i]>orinum2[j] );
+			for( tmpptr = localhom[i][j]; tmpptr; tmpptr = tmpptr->next )
+			{
+				if( swap ) { s1 = tmpptr->start2; e1 = tmpptr->end2; s2 = tmpptr->start1; e2 = tmpptr->end1; }
+				else       { s1 = tmpptr->start1; e1 = tmpptr->end1; s2 = tmpptr->start2; e2 = tmpptr->end2; }
+				if( s1 < 0 || s2 < 0 || e1 < s1 || e2 < s2 || e1 >= nres1[i] || e2 >= nres2[j] ) return( 0 );
+				nseg++;
+			}
+		}
+	}
+	if( nseg == 0 ) return( 1 );
+	nband = ( lgth1 + FILLIMP_BAND - 1 ) / FILLIMP_BAND;
+	seg = malloc( sizeof( fillimp_seg ) * nseg );
+	bstart = calloc( nband + 1, sizeof( int ) );
+	bfill = malloc( sizeof( int ) * ( nband + 1 ) );
+	k = 0;
+	for( i=0; i<clus1; i++ )
+	{
+		swap = ( swaplist && swaplist[i] );
+		for( j=0; j<clus2; j++ )
+		{
+			if( swaplist == NULL && orinum1 && orinum2 ) swap = ( orinum1[i]>orinum2[j] );
+			effij = eff1[i] * eff2[j] * effijx;
+			effij_kozo = eff1_kozo[i] * eff2_kozo[j] * effijx;
+			for( tmpptr = localhom[i][j]; tmpptr; tmpptr = tmpptr->next )
+			{
+				if( swap ) { s1 = tmpptr->start2; e1 = tmpptr->end2; s2 = tmpptr->start1; e2 = tmpptr->end1; }
+				else       { s1 = tmpptr->start1; e1 = tmpptr->end1; s2 = tmpptr->start2; e2 = tmpptr->end2; }
+				seg[k].p1 = map1[i] + s1;
+				seg[k].p2 = map2[j] + s2;
+				seg[k].n = MIN( e1 - s1, e2 - s2 ) + 1;
+				seg[k].cur = 0;
+				seg[k].segimp = tmpptr->importance;
+				seg[k].w = ( tmpptr->korh == 'k' ) ? effij_kozo : effij;
+				for( b = seg[k].p1[0] / FILLIMP_BAND; b <= seg[k].p1[seg[k].n-1] / FILLIMP_BAND; b++ ) bstart[b+1]++;
+				k++;
+			}
+		}
+	}
+	for( b=0; b<nband; b++ ) bstart[b+1] += bstart[b];
+	nlist = bstart[nband];
+	blist = malloc( sizeof( int ) * ( nlist + 1 ) );
+	memcpy( bfill, bstart, sizeof( int ) * ( nband + 1 ) );
+	for( k=0; k<nseg; k++ )
+		for( b = seg[k].p1[0] / FILLIMP_BAND; b <= seg[k].p1[seg[k].n-1] / FILLIMP_BAND; b++ ) blist[bfill[b]++] = k;
+
+	for( b=0; b<nband; b++ )
+	{
+		int bend = ( b + 1 ) * FILLIMP_BAND, l;
+		for( l=bstart[b]; l<bstart[b+1]; l++ )
+		{
+			fillimp_seg *sg = seg + blist[l];
+			int *p1 = sg->p1, *p2 = sg->p2, cnt = sg->n;
+			double segimp = sg->segimp, w = sg->w;
+			for( n = sg->cur; n < cnt && p1[n] < bend; n++ )
+			{
+				int k1 = p1[n], k2 = p2[n];
+				impmtx[k1][k2] = MULADD( segimp, w, impmtx[k1][k2] );
+				if( k2 < rowlo[k1] ) rowlo[k1] = k2;
+				if( k2 > rowhi[k1] ) rowhi[k1] = k2;
+			}
+			sg->cur = n;
+		}
+	}
+	free( seg ); free( bstart ); free( bfill ); free( blist );
+	return( 1 );
+}
+#endif
 
 /* rowlo/rowhi == NULL: zero lgth1 x lgth2 first (original behaviour).
    Otherwise the caller guarantees impmtx is already zero and gets, per row, the range of columns written. */
@@ -16151,6 +16440,10 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 	for( i=0; i<clus1; i++ ) { map1[i] = malloc( ( lgth1 + 1 ) * sizeof( int ) ); nres1[i] = makeresmap( seq1[i], map1[i] ); }
 	for( j=0; j<clus2; j++ ) { map2[j] = malloc( ( lgth2 + 1 ) * sizeof( int ) ); nres2[j] = makeresmap( seq2[j], map2[j] ); }
 
+#if defined(__aarch64__) && !defined(__APPLE__)
+	if( fillimp_banded( impmtx, clus1, clus2, lgth1, eff1, eff2, eff1_kozo, eff2_kozo, effijx, localhom, swaplist, orinum1, orinum2, rowlo, rowhi, map1, map2, nres1, nres2 ) )
+		goto fillimp_done;
+#endif
 	for( i=0; i<clus1; i++ )
 	{
 		swap = ( swaplist && swaplist[i] );
@@ -16218,6 +16511,9 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 			}
 		}
 	}
+#if defined(__aarch64__) && !defined(__APPLE__)
+fillimp_done:
+#endif
 	for( i=0; i<clus1; i++ ) free( map1[i] );
 	for( j=0; j<clus2; j++ ) free( map2[j] );
 	free( map1 ); free( map2 ); free( nres1 ); free( nres2 );
