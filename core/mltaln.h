@@ -8,6 +8,7 @@
 #else
 #endif
 
+#include "mafft_simd.h"
 #include "mafft.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,51 +40,14 @@
 #define VERSION "7.526-opt7"
 #define SHOWVERSION reporterr( "%s (%s) Version " VERSION "\nalg=%c, model=%s, amax=%3.1f\n%d thread(s)\n\n", progName( argv[0] ), (dorp=='d')?"nuc":((nblosum==-2)?"text":"aa"), alg, modelname, specificityconsideration, nthread )
 
-/* a*b+c rounded the way the stock build rounds it, for rewritten code that must stay
-   bit-identical.  clang on arm64 contracts a*b+c into one fused (singly rounded) multiply-add;
-   gcc with -std=c99 (the Makefile default) never contracts, and the x86-64 baseline has no FMA
-   at all.  Override with -DMAFFT_STOCK_FMA=0/1 for a reference built differently. */
-#ifndef MAFFT_STOCK_FMA
-#if defined(__aarch64__) && defined(__clang__)
-#define MAFFT_STOCK_FMA 1
-#else
-#define MAFFT_STOCK_FMA 0
-#endif
-#endif
-#if MAFFT_STOCK_FMA
-#define MULADD(a,b,c) fma( (a), (b), (c) )
-#else
-#define MULADD(a,b,c) ( (a)*(b) + (c) )
-#endif
-
-/* x86 kernels for AVX-512 CPUs that also have VPOPCNTDQ and VBMI2 (Intel Ice Lake and later, AMD
-   Zen 4 and later), written on Zen 5 and Granite Rapids.  -march=x86-64-v4 includes neither, so a
-   build with it alone compiles exactly the code it did before; select these kernels with, for
-   example, -march=x86-64-v4 -mavx512vpopcntdq -mavx512vbmi2, or -march=znver4, znver5,
-   icelake-server, sapphirerapids or graniterapids. */
-#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VPOPCNTDQ__) && defined(__AVX512VBMI2__) && !defined(__ARM_NEON)
-#define MAFFT_AVX512X 1
-#endif
 #if defined(MAFFT_AVX512X)
 /* bit l of mask[j] = ( cpmx[l][j] != 0 ) for l < nalph <= 32 (mltaln9.c) */
 extern void cpmx_colmask( double **cpmx, int nalph, int lgth, unsigned int *mask );
 #endif
 
-/* The AVX2 (4 x double) paths: in a build that does not contract a*b+c, or, with
-   MAFFT_STOCK_FMA, where FMA instructions can round like the contracting stock build. */
-#if defined(__AVX2__) && !defined(__ARM_NEON) && ( !MAFFT_STOCK_FMA || defined(__FMA__) )
-#define MAFFT_AVX2_PATHS 1
-#endif
-/* AVX2 code that came after dikarya1 (the gapruns and alignableReagion passes).  In the
-   non-contracting (gcc) class it would change the objects of the dikarya1 build, which was
-   verified on its own hardware, so there it is opt-in: -DMAFFT_AVX2_EXTRA=1. */
-#if defined(__AVX2__) && !defined(__ARM_NEON) && ( MAFFT_STOCK_FMA || defined(MAFFT_AVX2_EXTRA) )
-#define MAFFT_AVX2_NEWPATHS 1
-#endif
-
 /* scarr[l] = sum over j of mtx[j][l] * cpmx1[j][i1], added in ascending j from +0 (see mltaln9.c);
    not in the AVX-512 builds of the contracting class, whose code predates it */
-#if defined(MAFFT_AVX2_PATHS) && !( MAFFT_STOCK_FMA && defined(__AVX512F__) )
+#if defined(MAFFT_AVX2_PATHS) && !( MAFFT_STOCK_FMA && defined(MAFFT_AVX512) )
 #define HAVE_SCARR_FILL 1
 extern void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 );
 #endif

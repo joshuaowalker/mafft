@@ -157,7 +157,7 @@ OBJGALN = io.o mtxutl.o mltaln9.o tddis.o constants.o partSalignmm.o MSalignmm.o
           SAalignmm.o Galign11.o Lalign11.o genalign11.o Falign.o Falign_localhom.o fftFunctions.o fft.o mafft-profile.o defs.o
 OBJSCORE = io.o mtxutl.o mltaln9.o score.o constants.o defs.o Galign11.o Lalign11.o genalign11.o
 
-HEADER = mltaln.h mtxutl.h mafft.h
+HEADER = mltaln.h mafft_simd.h mtxutl.h mafft.h
 FFTHEADER = fft.h
 
 MANPAGES = mafft.1 mafft-homologs.1

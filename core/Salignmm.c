@@ -1122,34 +1122,6 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 }
 
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#if !defined(__APPLE__)
-/* 2 x (a*b+c) rounded like MULADD (Linux arm64; the Apple build keeps its own NEON code) */
-#if MAFFT_STOCK_FMA
-#define NMULADD(a,b,c) vfmaq_f64( (c), (a), (b) )
-#else
-#define NMULADD(a,b,c) vaddq_f64( vmulq_f64( (a), (b) ), (c) )
-#endif
-#endif
-#elif defined(__AVX512F__) && defined(__AVX512VL__)
-#include <immintrin.h>
-#if MAFFT_STOCK_FMA
-#define VMULADD(a,b,c) _mm512_fmadd_pd( (a), (b), (c) )
-#else
-#define VMULADD(a,b,c) _mm512_add_pd( _mm512_mul_pd( (a), (b) ), (c) )
-#endif
-#elif defined(MAFFT_AVX2_PATHS)
-#include <immintrin.h>
-/* a*b+c rounded like MULADD */
-#if MAFFT_STOCK_FMA
-#define VMULADD4(a,b,c) _mm256_fmadd_pd( (a), (b), (c) )
-#else
-#define VMULADD4(a,b,c) _mm256_add_pd( _mm256_mul_pd( (a), (b) ), (c) )
-#endif
-/* 4 x 64-bit compare mask -> 4 x 32-bit mask */
-#define PACKMASK4(c) _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_castpd_si256( c ), _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 ) ) )
-#endif
 /*
  * One row of the A__align fill for trywarp == 0 and fpenalty_ex == 0.0 (the default), equivalent
  * to the scalar j-loop.  All candidates for cell (i,j) come from row i-1; the horizontal state mi is
@@ -1168,7 +1140,7 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 
 	MI[1] = mi0; MPI[1] = 0;
 	j = 1;
-#if defined(__AVX512F__) && defined(__AVX512VL__)
+#if defined(MAFFT_AVX512)
 	/* The running best as a prefix scan over (value, position) pairs, 8 at a time: a later pair
 	   replaces an earlier one only if its value is greater or equal (ties take the later, as '>='), which is
 	   associative, so three shift+compare+blend steps (and the carry from the previous block)
@@ -1228,7 +1200,7 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 	}
 
 	j = 1;
-#if defined(__ARM_NEON) && MAFFT_STOCK_FMA /* vfmaq: fused, like the stock arm64 build */
+#if defined(MAFFT_A64) && MAFFT_STOCK_FMA /* vfmaq: fused, like the stock arm64 build */
 	{
 		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va ), vext = vdupq_n_f64( ext );
 		int32x2_t vi = vdup_n_s32( i ), vi1 = vdup_n_s32( i-1 ), vzero = vdup_n_s32( 0 ), vtwo = vdup_n_s32( 2 );
@@ -1262,7 +1234,7 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 			vj = vadd_s32( vj, vtwo );
 		}
 	}
-#elif defined(__AVX512F__) && defined(__AVX512VL__)
+#elif defined(MAFFT_AVX512)
 	/* The same, 8 cells at a time; VMULADD rounds like MULADD. */
 	{
 		__m512d vgf1va = _mm512_set1_pd( gf1va ), vfgcp1va = _mm512_set1_pd( fgcp1va ), vogcp1va = _mm512_set1_pd( ogcp1va ), vext = _mm512_set1_pd( ext );
@@ -1331,7 +1303,7 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 			vj = _mm_add_epi32( vj, vfour );
 		}
 	}
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 	/* The NEON block above for builds that do not fuse (gcc): NMULADD rounds like MULADD. */
 	{
 		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va ), vext = vdupq_n_f64( ext );

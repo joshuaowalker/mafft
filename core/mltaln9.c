@@ -1,9 +1,5 @@
 #include "mltaln.h"
-#if defined(__AVX512F__) && !defined(__ARM_NEON)
-#include <immintrin.h>
-#endif
-#if defined(__ARM_NEON) && !defined(__APPLE__)
-#include <arm_neon.h>
+#if defined(MAFFT_A64) && !defined(__APPLE__)
 #define IGS_NEON 1 /* Linux arm64: NEON igs_prep and table-lookup column sums (no Accelerate) */
 #endif
 
@@ -1068,7 +1064,7 @@ static int igs_pairscores( char **seq1, char **seq2, int clus1, int clus2, int l
 				unsigned char *m2 = (unsigned char *)seq2[j];
 				int s0 = 0, s1 = 0, s2 = 0, s3 = 0;
 				k = 0;
-#if defined(__AVX512F__) && !defined(__ARM_NEON)
+#if defined(MAFFT_AVX512)
 				/* integer sums (every partial below dzmax*len < 1e9): exact in any order */
 				{
 					__m512i acc = _mm512_setzero_si512();
@@ -13514,15 +13510,10 @@ void getkyokaigap( char *g, char **s, int pos, int n )
  * as the column-by-column loops.  NEON finds the run boundaries 16 bytes at a time, AVX-512BW 64
  * and AVX2 32: integer compares only, so the runs are the same in every build.
  */
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#elif defined(__AVX512BW__) || defined(__AVX2__)
-#include <immintrin.h>
-#endif
 static int gapruns( char *s, int len, int *st, int *en )
 {
 	int i = 0, n = 0, in = 0;
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 	uint8x16_t dash = vdupq_n_u8( '-' ), zero = vdupq_n_u8( 0 ), ones = vdupq_n_u8( 0xff );
 	for( ; i+16<=len; i+=16 )
 	{
@@ -13537,7 +13528,7 @@ static int gapruns( char *s, int len, int *st, int *en )
 			bits &= ~( 0xfULL << ( b * 4 ) );
 		}
 	}
-#elif defined(__AVX512BW__)
+#elif defined(MAFFT_AVX512)
 	{
 		__m512i dash = _mm512_set1_epi8( '-' );
 		for( ; i+64<=len; i+=64 )
@@ -16636,7 +16627,7 @@ static int makeresmap_avx512( char *seq, int *map )
 #define RESMAP_SLACK 0
 #endif
 
-#if defined(__aarch64__) && !defined(__APPLE__)
+#if defined(MAFFT_A64) && !defined(__APPLE__)
 /*
  * The segment walk of fillimp_track() in bands of FILLIMP_BAND rows of impmtx (Linux arm64).  The
  * walk touches about 1.7 billion cells per L-INS-i shard spread over a ~32 MB matrix; Graviton's
@@ -16775,7 +16766,7 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 	for( i=0; i<clus1; i++ ) { map1[i] = malloc( ( lgth1 + 1 + RESMAP_SLACK ) * sizeof( int ) ); nres1[i] = makeresmap( seq1[i], map1[i] ); }
 	for( j=0; j<clus2; j++ ) { map2[j] = malloc( ( lgth2 + 1 + RESMAP_SLACK ) * sizeof( int ) ); nres2[j] = makeresmap( seq2[j], map2[j] ); }
 
-#if defined(__aarch64__) && !defined(__APPLE__)
+#if defined(MAFFT_A64) && !defined(__APPLE__)
 	if( fillimp_banded( impmtx, clus1, clus2, lgth1, eff1, eff2, eff1_kozo, eff2_kozo, effijx, localhom, swaplist, orinum1, orinum2, rowlo, rowhi, map1, map2, nres1, nres2 ) )
 		goto fillimp_done;
 #endif
@@ -16862,7 +16853,7 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 			}
 		}
 	}
-#if defined(__aarch64__) && !defined(__APPLE__)
+#if defined(MAFFT_A64) && !defined(__APPLE__)
 fillimp_done:
 #endif
 	for( i=0; i<clus1; i++ ) free( map1[i] );
@@ -17468,7 +17459,6 @@ void fillimp_file( double **impmtx, double *imp, int clus1, int clus2, int lgth1
 
 
 #if defined(HAVE_SCARR_FILL)
-#include <immintrin.h>
 /*
  * The profile-score vector every match_calc builds:  for each l, scarr[l] = 0.0 and then
  * scarr[l] += mtx[j][l] * cpmx1[j][i1] for j = 0 .. nalphabets-1.  Only the letters present in

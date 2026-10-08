@@ -1,9 +1,5 @@
 #include "mltaln.h"
-#if ( defined(__AVX512BW__) || defined(MAFFT_AVX2_NEWPATHS) ) && !defined(__ARM_NEON)
-#include <immintrin.h>
-#endif
-#if defined(__ARM_NEON) && !defined(__APPLE__)
-#include <arm_neon.h>
+#if defined(MAFFT_A64) && !defined(__APPLE__)
 /* One bit (bit 4t) per byte t of x that differs from every byte of the masks OR-ed into eq. */
 #define NEON_NIBBLES( eq ) ( ~vget_lane_u64( vreinterpret_u64_u8( vshrn_n_u16( vreinterpretq_u16_u8( eq ), 4 ) ), 0 ) & 0x1111111111111111ULL )
 /*
@@ -310,7 +306,7 @@ int alignableReagion( int    clus1, int    clus2,
 		unsigned char seenc[0x100];
 		int used[26], ub[26], cidx[0x100], nu = 0, ok = 1, c;
 		memset( seenc, 0, sizeof( seenc ) );
-#if defined(__AVX512BW__)
+#if defined(MAFFT_AVX512)
 		/* Mark a few characters whose bins are valid as present up front and visit only the other
 		   bytes.  An extra valid character only adds a bin whose profile is all zero, which the
 		   site score below skips, so stra[] and the ok test come out the same. */
@@ -334,7 +330,7 @@ int alignableReagion( int    clus1, int    clus2,
 				for( ; i<len; i++ ) seenc[s[i]] = 1;
 			}
 		}
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 		/* The AVX-512BW block above, 16 bytes at a time (Linux arm64). */
 		{
 			static const unsigned char common[] = "-acgtACGT";
@@ -451,7 +447,7 @@ int alignableReagion( int    clus1, int    clus2,
 			}
 			goto profiles_done;
 #else
-#if defined(__AVX512BW__)
+#if defined(MAFFT_AVX512)
 			/* the same adds in the same order, visiting only the non-gap bytes (when '-' has no bin) */
 			for( j=0; j<clus1+clus2 && cidx['-'] < 0; j++ )
 			{
@@ -471,7 +467,7 @@ int alignableReagion( int    clus1, int    clus2,
 				for( ; i<len; i++ ) { int ci = cidx[s[i]]; if( ci >= 0 ) cp[i*nu+ci] += e; }
 			}
 			if( cidx['-'] >= 0 )
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 			/* the same adds in the same order, visiting only the non-gap bytes (when '-' has no bin) */
 			for( j=0; j<clus1+clus2 && cidx['-'] < 0; j++ )
 			{

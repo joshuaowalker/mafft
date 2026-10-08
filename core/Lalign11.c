@@ -2,16 +2,10 @@
 #include "dp.h"
 #include <limits.h>
 #include <stdint.h>
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#if defined(__ARM_FEATURE_SVE) && !defined(__APPLE__)
-#include <arm_sve.h>
+#if defined(MAFFT_SVE)
 #ifndef LSVE_MINLANES
 #define LSVE_MINLANES 8 /* the SVE fill is used for vectors of at least this many int32 lanes */
 #endif
-#endif
-#elif defined(__AVX512F__) || defined(__SSE4_1__)
-#include <immintrin.h>
 #endif
 
 #define DEBUG 0
@@ -105,12 +99,12 @@ static void match_calc_bk( double *match, double **cpmx1, double **cpmx2, int i1
 }
 #endif
 
-#if ( defined(__AVX2__) && !defined(__ARM_NEON) ) || ( defined(__ARM_NEON) && !defined(__APPLE__) )
+#if defined(MAFFT_AVX2) || ( defined(MAFFT_A64) && !defined(__APPLE__) )
 /*
  * Used by every AVX2 build, AVX-512 builds included: on Zen 4 (c7a) this fill made L-INS-i
- * about 7% faster than the AVX-512 prefix-scan fill further down, which AVX-512 builds used
- * before.  The integer DP is the same under every rounding class, so MAFFT_STOCK_FMA does not
- * matter here.  arm64 builds other than Apple's (Linux on Graviton) use it too, with a NEON
+ * about 7% faster than the AVX-512 prefix-scan fill that AVX-512 builds used before (opt5).
+ * The integer DP is the same under every rounding class, so MAFFT_STOCK_FMA does not matter
+ * here.  arm64 builds other than Apple's (Linux on Graviton) use it too, with a NEON
  * loop; the Apple build keeps the prefix-scan fill (its all-pairs stage runs on the GPU).
  *
  * The AVX2 integer fill (Lfill_int below) does not compute the traceback offsets themselves.  A
@@ -298,7 +292,7 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
  * loop runs 4 cells at a time with NEON, or svcntw() at a time with SVE when the vectors are at
  * least 256 bits wide (Graviton3); 128-bit SVE (Graviton4) uses the NEON loop.
  */
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 #define LPROF_STRIDE ( ( lgth2 + 4 + 3 ) & ~3 ) /* each profile row 16-byte aligned */
 #else
 #define LPROF_STRIDE ( lgth2 + 4 )
@@ -312,10 +306,10 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 	double thr = -offset + scoreoffset * 600;
 	int ithr, *prof[0x100], *profbuf, nprof = 0;
 	int *prev, *cur, *vm, *hq, *wmrow, *vmraw;
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 	int *kx, *kp, needwm, endpend = 0;
 #endif
-#if defined(__ARM_FEATURE_SVE)
+#if defined(MAFFT_SVE)
 	/* lsve_nstep: 0 (use NEON), else the log2 of the lanes per SVE vector (2..4 handled) */
 	int vl = (int)svcntw(), lsve_nstep = ( vl >= LSVE_MINLANES && vl <= 16 ) ? ( vl >= 16 ? 4 : vl >= 8 ? 3 : 2 ) : 0;
 #endif
@@ -383,7 +377,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 #ifdef MAFFT_POISON_TEST
 	memset( lr_raw, 0xa5, sizeof( int ) * need );
 #endif
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 	/* the NEON loop starts at cell 4 (ijp rows come from malloc, 16-byte aligned): row cell 4 aligned too */
 	lr_base = (int *)( ( (uintptr_t)( lr_raw + 8 ) & ~(uintptr_t)31 ) );
 #else
@@ -391,7 +385,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 #endif
 	lr_ext = ext;
 	vmraw = malloc( sizeof( int ) * ( lgth2 + 16 ) );
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 	vm    = (int *)( ( (uintptr_t)( vmraw + 8 ) & ~(uintptr_t)31 ) );
 	/* kx[k] = k*ext, kp[k] = k*ext + ext + pen (horizontal gap scan offsets, read by the NEON loop) */
 	kx = malloc( sizeof( int ) * 2 * ( lgth2 + 8 ) );
@@ -428,7 +422,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		rowmax = INT_MIN;
 		if( !profrow ) profrow = prof[u1[0]]; /* last row: cur[] is never read again */
 		j = 1;
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 		/* Once maxwm > ithr, a row whose maximum beats it has rowmax > ithr, and its first cell
 		   holding rowmax is the first j with cur[j] - profrow[j] == rowmax (a clamped cell gives
 		   ithr there, below rowmax; any other gives its wm).  The vector loops then skip wmrow,
@@ -459,7 +453,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 				cur[j] = wm + profrow[j];
 			}
 		}
-#if defined(__ARM_FEATURE_SVE)
+#if defined(MAFFT_SVE)
 		if( j == 4 && lsve_nstep )
 		{
 			/* SVE, vector-length agnostic: svcntw() cells at a time (chosen only for vectors of at
@@ -670,7 +664,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 			ijrow[j] = ij;
 			cur[j] = wm + profrow[j];
 		}
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 		if( rowmax > maxwm && !needwm )
 		{
 			maxwm = rowmax; endali = i; endpend = 1;
@@ -679,7 +673,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 #endif
 		if( rowmax > maxwm )
 		{
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 			endpend = 0;
 			/* first cell holding rowmax (it is always present): 16 cells per test, then 4 */
 			int32x4_t vr = vdupq_n_s32( rowmax );
@@ -706,7 +700,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		if( i < lgth1 ) cur[0] = (int)amino_dynamicmtx[u2[0]][u1[i]]; /* currentw[0] = initverticalw[i] */
 	}
 
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 	if( endpend )
 	{
 		int *r = LROW( endali ), *pr = ( endali < lgth1 ) ? prof[u1[endali]] : prof[u1[0]];
@@ -716,7 +710,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 	}
 #endif
 	free( profbuf ); free( vmraw ); free( hq ); free( wmrow );
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 	free( kx );
 #endif
 	*maxwmpt = (double)maxwm;
@@ -1179,7 +1173,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		rowmax = INT_MIN;
 		if( !profrow ) profrow = prof[u1[0]]; /* last row: cur[] is never read again */
 		j = 1;
-#if defined(__ARM_NEON)
+#if defined(MAFFT_A64)
 		{
 			int32x4_t vpen = vdupq_n_s32( pen ), vext = vdupq_n_s32( ext ), vthr = vdupq_n_s32( ithr );
 			int32x4_t vstop = vdupq_n_s32( lstop ), vi = vdupq_n_s32( i ), vi1 = vdupq_n_s32( negi1 );
@@ -1242,158 +1236,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 			rowmax = vmaxvq_s32( vmax );
 			if( j > 1 ) { tbest = vgetq_lane_s32( cv, 0 ); tbestk = vgetq_lane_s32( ck, 0 ); }
 		}
-#elif defined(__AVX512F__)
-		/* The NEON block above, 16 cells at a time: valignd shifts lanes in from a fill vector,
-		   so each prefix max takes four shift+max steps instead of two. */
-		{
-			__m512i vpen = _mm512_set1_epi32( pen ), vext = _mm512_set1_epi32( ext ), vthr = _mm512_set1_epi32( ithr );
-			__m512i vstop = _mm512_set1_epi32( lstop ), vi = _mm512_set1_epi32( i ), vi1 = _mm512_set1_epi32( negi1 );
-			__m512i vmax = _mm512_set1_epi32( INT_MIN ), vsixteen = _mm512_set1_epi32( 16 );
-			__m512i lane = _mm512_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 );
-			__m512i vj = _mm512_add_epi32( lane, _mm512_set1_epi32( 1 ) );
-			__m512i ninf = _mm512_set1_epi32( INT_MIN ), none = _mm512_set1_epi32( -1 ), last = _mm512_set1_epi32( 15 );
-			__m512i cv = ninf, ck = _mm512_setzero_si512();
-			__m512i kv = _mm512_sub_epi32( lane, _mm512_set1_epi32( 1 ) );
-			__m512i kext = _mm512_mullo_epi32( kv, vext ), kext1 = _mm512_add_epi32( kext, vext ), ext16 = _mm512_mullo_epi32( vsixteen, vext );
-			for( ; j+15<=lgth2; j+=16 )
-			{
-				__m512i p = _mm512_loadu_si512( prev + j - 1 );
-				__m512i hqv, hkv;
-				{
-					__m512i v = _mm512_sub_epi32( _mm512_loadu_si512( prev + j - 2 ), kext );
-					__m512i x, e, r, t;
-					x = _mm512_max_epi32( v, _mm512_alignr_epi32( v, ninf, 15 ) );
-					x = _mm512_max_epi32( x, _mm512_alignr_epi32( x, ninf, 14 ) );
-					x = _mm512_max_epi32( x, _mm512_alignr_epi32( x, ninf, 12 ) );
-					x = _mm512_max_epi32( x, _mm512_alignr_epi32( x, ninf, 8 ) );
-					x = _mm512_max_epi32( x, cv );
-					e = _mm512_alignr_epi32( x, cv, 15 );
-					r = _mm512_mask_blend_epi32( _mm512_cmpgt_epi32_mask( v, e ), none, kv );
-					t = _mm512_max_epi32( r, _mm512_alignr_epi32( r, none, 15 ) );
-					t = _mm512_max_epi32( t, _mm512_alignr_epi32( t, none, 14 ) );
-					t = _mm512_max_epi32( t, _mm512_alignr_epi32( t, none, 12 ) );
-					t = _mm512_max_epi32( t, _mm512_alignr_epi32( t, none, 8 ) );
-					t = _mm512_max_epi32( t, ck );
-					hqv = _mm512_add_epi32( x, kext1 );
-					hkv = t;
-					cv = _mm512_permutexvar_epi32( last, x );
-					ck = _mm512_permutexvar_epi32( last, t );
-					kv = _mm512_add_epi32( kv, vsixteen );
-					kext = _mm512_add_epi32( kext, ext16 );
-					kext1 = _mm512_add_epi32( kext1, ext16 );
-				}
-				__m512i g, wm, ij, m, vmj, vmpj;
-				__mmask16 c;
-				wm = p;
-				ij = _mm512_setzero_si512();
-				g = _mm512_add_epi32( hqv, vpen );
-				c = _mm512_cmpgt_epi32_mask( g, wm );
-				wm = _mm512_max_epi32( wm, g );
-				ij = _mm512_mask_blend_epi32( c, ij, _mm512_sub_epi32( hkv, vj ) );
-				vmj = _mm512_loadu_si512( vm + j );
-				vmpj = _mm512_loadu_si512( vmp + j );
-				g = _mm512_add_epi32( vmj, vpen );
-				c = _mm512_cmpgt_epi32_mask( g, wm );
-				wm = _mm512_max_epi32( wm, g );
-				ij = _mm512_mask_blend_epi32( c, ij, _mm512_sub_epi32( vi, vmpj ) );
-				c = _mm512_cmpgt_epi32_mask( p, vmj );
-				m = _mm512_max_epi32( p, vmj );
-				_mm512_storeu_si512( vm + j, _mm512_add_epi32( m, vext ) );
-				_mm512_storeu_si512( vmp + j, _mm512_mask_blend_epi32( c, vmpj, vi1 ) );
-				_mm512_storeu_si512( wmrow + j, wm );
-				vmax = _mm512_max_epi32( vmax, wm );
-				c = _mm512_cmpgt_epi32_mask( vthr, wm );
-				ij = _mm512_mask_blend_epi32( c, ij, vstop );
-				wm = _mm512_max_epi32( wm, vthr );
-				_mm512_storeu_si512( ijrow + j, ij );
-				_mm512_storeu_si512( cur + j, _mm512_add_epi32( wm, _mm512_loadu_si512( profrow + j ) ) );
-				vj = _mm512_add_epi32( vj, vsixteen );
-			}
-			rowmax = _mm512_reduce_max_epi32( vmax );
-			if( j > 1 ) { tbest = _mm_cvtsi128_si32( _mm512_castsi512_si128( cv ) ); tbestk = _mm_cvtsi128_si32( _mm512_castsi512_si128( ck ) ); }
-		}
-#elif defined(__AVX2__)
-		/* The NEON block above, 8 cells at a time.  On Haswell/Broadwell every cross-lane shuffle
-		   and every vpblendvb issues on port 5 only, so the prefix maxima use in-lane byte shifts
-		   (vpslldq) with the fill OR-ed into the vacated lanes, one vpermd to carry the low half
-		   into the high half, and blends are and/xor.  Same comparisons, cell for cell. */
-#define AVX2_BLEND( a, b, m ) _mm256_xor_si256( (a), _mm256_and_si256( _mm256_xor_si256( (a), (b) ), (m) ) )
-		{
-			const __m256i vpen = _mm256_set1_epi32( pen ), vext = _mm256_set1_epi32( ext ), vthr = _mm256_set1_epi32( ithr );
-			const __m256i vstop = _mm256_set1_epi32( lstop ), vi = _mm256_set1_epi32( i ), vi1 = _mm256_set1_epi32( negi1 );
-			const __m256i veight = _mm256_set1_epi32( 8 ), ninf = _mm256_set1_epi32( INT_MIN ), none = _mm256_set1_epi32( -1 );
-			const __m256i fill1 = _mm256_setr_epi32( INT_MIN, 0, 0, 0, INT_MIN, 0, 0, 0 );
-			const __m256i fill2 = _mm256_setr_epi32( INT_MIN, INT_MIN, 0, 0, INT_MIN, INT_MIN, 0, 0 );
-			const __m256i none1 = _mm256_setr_epi32( -1, 0, 0, 0, -1, 0, 0, 0 );
-			const __m256i none2 = _mm256_setr_epi32( -1, -1, 0, 0, -1, -1, 0, 0 );
-			const __m256i idx3 = _mm256_set1_epi32( 3 ), last = _mm256_set1_epi32( 7 );
-			const __m256i idxe = _mm256_setr_epi32( 0, 0, 1, 2, 3, 4, 5, 6 );
-			const __m256i ext8 = _mm256_mullo_epi32( veight, vext );
-			__m256i vmax = ninf, vj = _mm256_setr_epi32( 1, 2, 3, 4, 5, 6, 7, 8 );
-			__m256i cv = ninf, ck = _mm256_setzero_si256();
-			__m256i kv = _mm256_setr_epi32( -1, 0, 1, 2, 3, 4, 5, 6 );
-			__m256i kext = _mm256_mullo_epi32( kv, vext ), kext1 = _mm256_add_epi32( kext, vext );
-			for( ; j+7<=lgth2; j+=8 )
-			{
-				__m256i p = _mm256_loadu_si256( (__m256i *)( prev + j - 1 ) );
-				__m256i hqv, hkv;
-				{
-					__m256i v = _mm256_sub_epi32( _mm256_loadu_si256( (__m256i *)( prev + j - 2 ) ), kext );
-					__m256i x, e, r, t;
-					x = _mm256_max_epi32( v, _mm256_or_si256( _mm256_bslli_epi128( v, 4 ), fill1 ) );
-					x = _mm256_max_epi32( x, _mm256_or_si256( _mm256_bslli_epi128( x, 8 ), fill2 ) );
-					x = _mm256_max_epi32( x, _mm256_blend_epi32( ninf, _mm256_permutevar8x32_epi32( x, idx3 ), 0xf0 ) );
-					x = _mm256_max_epi32( x, cv );
-					e = _mm256_blend_epi32( _mm256_permutevar8x32_epi32( x, idxe ), cv, 0x01 );
-					/* kv where v > e, else -1 */
-					r = _mm256_or_si256( kv, _mm256_andnot_si256( _mm256_cmpgt_epi32( v, e ), none ) );
-					t = _mm256_max_epi32( r, _mm256_or_si256( _mm256_bslli_epi128( r, 4 ), none1 ) );
-					t = _mm256_max_epi32( t, _mm256_or_si256( _mm256_bslli_epi128( t, 8 ), none2 ) );
-					t = _mm256_max_epi32( t, _mm256_blend_epi32( none, _mm256_permutevar8x32_epi32( t, idx3 ), 0xf0 ) );
-					t = _mm256_max_epi32( t, ck );
-					hqv = _mm256_add_epi32( x, kext1 );
-					hkv = t;
-					cv = _mm256_permutevar8x32_epi32( x, last );
-					ck = _mm256_permutevar8x32_epi32( t, last );
-					kv = _mm256_add_epi32( kv, veight );
-					kext = _mm256_add_epi32( kext, ext8 );
-					kext1 = _mm256_add_epi32( kext1, ext8 );
-				}
-				__m256i g, wm, ij, m, vmj, vmpj, c;
-				wm = p;
-				g = _mm256_add_epi32( hqv, vpen );
-				c = _mm256_cmpgt_epi32( g, wm );
-				wm = _mm256_max_epi32( wm, g );
-				ij = _mm256_and_si256( c, _mm256_sub_epi32( hkv, vj ) );
-				vmj = _mm256_loadu_si256( (__m256i *)( vm + j ) );
-				vmpj = _mm256_loadu_si256( (__m256i *)( vmp + j ) );
-				g = _mm256_add_epi32( vmj, vpen );
-				c = _mm256_cmpgt_epi32( g, wm );
-				wm = _mm256_max_epi32( wm, g );
-				ij = AVX2_BLEND( ij, _mm256_sub_epi32( vi, vmpj ), c );
-				c = _mm256_cmpgt_epi32( p, vmj );
-				m = _mm256_max_epi32( p, vmj );
-				_mm256_storeu_si256( (__m256i *)( vm + j ), _mm256_add_epi32( m, vext ) );
-				_mm256_storeu_si256( (__m256i *)( vmp + j ), AVX2_BLEND( vmpj, vi1, c ) );
-				_mm256_storeu_si256( (__m256i *)( wmrow + j ), wm );
-				vmax = _mm256_max_epi32( vmax, wm );
-				c = _mm256_cmpgt_epi32( vthr, wm );
-				ij = AVX2_BLEND( ij, vstop, c );
-				wm = _mm256_max_epi32( wm, vthr );
-				_mm256_storeu_si256( (__m256i *)( ijrow + j ), ij );
-				_mm256_storeu_si256( (__m256i *)( cur + j ), _mm256_add_epi32( wm, _mm256_loadu_si256( (__m256i *)( profrow + j ) ) ) );
-				vj = _mm256_add_epi32( vj, veight );
-			}
-			{
-				__m128i h = _mm_max_epi32( _mm256_castsi256_si128( vmax ), _mm256_extracti128_si256( vmax, 1 ) );
-				h = _mm_max_epi32( h, _mm_shuffle_epi32( h, 0x4e ) );
-				h = _mm_max_epi32( h, _mm_shuffle_epi32( h, 0xb1 ) );
-				rowmax = _mm_cvtsi128_si32( h );
-			}
-			if( j > 1 ) { tbest = _mm256_cvtsi256_si32( cv ); tbestk = _mm256_cvtsi256_si32( ck ); }
-		}
-#undef AVX2_BLEND
-#elif defined(__SSE4_1__)
+#elif defined(MAFFT_SSE41)
 		/* The NEON block above, lane for lane: palignr for vextq, pblendvb for vbslq. */
 		{
 			__m128i vpen = _mm_set1_epi32( pen ), vext = _mm_set1_epi32( ext ), vthr = _mm_set1_epi32( ithr );
@@ -1489,27 +1332,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		if( rowmax > maxwm )
 		{
 			j = 1;
-#if defined(__AVX512F__)
-			/* first cell holding rowmax, 16 at a time (it is always present) */
-			{
-				__m512i vr = _mm512_set1_epi32( rowmax );
-				for( ; j+15<=lgth2; j+=16 )
-				{
-					__mmask16 k = _mm512_cmpeq_epi32_mask( _mm512_loadu_si512( wmrow + j ), vr );
-					if( k ) { j += __builtin_ctz( (unsigned)k ); break; }
-				}
-			}
-#elif defined(__AVX2__) && !defined(__ARM_NEON)
-			/* first cell holding rowmax, 8 at a time (it is always present) */
-			{
-				__m256i vr = _mm256_set1_epi32( rowmax );
-				for( ; j+7<=lgth2; j+=8 )
-				{
-					int k = _mm256_movemask_ps( _mm256_castsi256_ps( _mm256_cmpeq_epi32( _mm256_loadu_si256( (__m256i *)( wmrow + j ) ), vr ) ) );
-					if( k ) { j += __builtin_ctz( (unsigned)k ); break; }
-				}
-			}
-#elif defined(__SSE4_1__) && !defined(__ARM_NEON)
+#if defined(MAFFT_SSE41)
 			{
 				__m128i vr = _mm_set1_epi32( rowmax );
 				for( ; j+3<=lgth2; j+=4 )

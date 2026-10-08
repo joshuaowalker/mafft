@@ -1,33 +1,6 @@
 #include "mltaln.h"
 #include "dp.h"
 #include <stdint.h>
-#if ( defined(__AVX512F__) || defined(__AVX2__) ) && !defined(__ARM_NEON)
-#include <immintrin.h>
-/* vector a*b+c rounded like MULADD */
-#if MAFFT_STOCK_FMA
-#define VMULADD(a,b,c) _mm512_fmadd_pd( (a), (b), (c) )
-#else
-#define VMULADD(a,b,c) _mm512_add_pd( _mm512_mul_pd( (a), (b) ), (c) )
-#endif
-#if defined(MAFFT_AVX2_PATHS)
-#if MAFFT_STOCK_FMA
-#define VMULADD4(a,b,c) _mm256_fmadd_pd( (a), (b), (c) )
-#else
-#define VMULADD4(a,b,c) _mm256_add_pd( _mm256_mul_pd( (a), (b) ), (c) )
-#endif
-/* 4 x 64-bit compare mask -> 4 x 32-bit mask */
-#define PACKMASK4(c) _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_castpd_si256( c ), _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 ) ) )
-#endif
-#endif
-#if defined(__ARM_NEON) && !defined(__APPLE__)
-#include <arm_neon.h>
-/* 2 x (a*b+c) rounded like MULADD (Linux arm64; the Apple build keeps its own NEON code) */
-#if MAFFT_STOCK_FMA
-#define NMULADD(a,b,c) vfmaq_f64( (c), (a), (b) )
-#else
-#define NMULADD(a,b,c) vaddq_f64( vmulq_f64( (a), (b) ), (c) )
-#endif
-#endif
 
 #define MACHIGAI 0
 #define OUTGAP0TRY 1
@@ -86,7 +59,7 @@ static void st_FinalGapCount( double *fgcp, int clus, char **seq, double *eff, i
 
 static TLS int impalloclen = 0;
 static TLS double **impmtx = NULL;
-#if defined(__linux__) && defined(__aarch64__)
+#if defined(__linux__) && defined(MAFFT_A64)
 /*
  * impmtx in one block of transparent huge pages (Linux arm64): fillimp_track's walk touches a
  * different row, i.e. a different 4 KB page, at every step, so with separately allocated rows
@@ -200,7 +173,7 @@ static void part_imp_match_out_vead_gapmap( double *imp, int i1, int lgth2, int 
 		return;
 	}
 #endif
-#if defined(__AVX512F__)
+#if defined(MAFFT_AVX512)
 	{
 		double *row = impmtx[i1] + start2;
 		for( ; j+7<lgth2; j+=8 )
@@ -209,7 +182,7 @@ static void part_imp_match_out_vead_gapmap( double *imp, int i1, int lgth2, int 
 			_mm512_storeu_pd( imp + j, _mm512_add_pd( _mm512_loadu_pd( imp + j ), g ) );
 		}
 	}
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 	/* No gather on NEON: where gapmap2 maps 4 consecutive j to 4 consecutive columns (most of the
 	   time), two vector loads; otherwise the scalar adds.  The same add for every element. */
 	{
@@ -543,7 +516,7 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 	if( scalloc < nalphabets ) { free( mc_scarr ); scalloc = nalphabets; mc_scarr = malloc( sizeof( double ) * scalloc ); }
 	scarr = mc_scarr;
 	l = 0;
-#if defined(__AVX512F__) && !defined(__ARM_NEON)
+#if defined(MAFFT_AVX512)
 	/* 8 letters at a time; each letter's sum still runs over j in order */
 	for( ; l+8<=nalphabets; l+=8 )
 	{
@@ -578,7 +551,7 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 			scarr[l] = s;
 		}
 	}
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 	/* The AVX2 block above, 2 letters at a time: only the letters present in column i1 (exact for
 	   the same reason), each lane's terms added in ascending j, rounded like MULADD. */
 	{
@@ -623,11 +596,11 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 		if( cnt == 1 )
 		{
 			double s0 = scarr[let[0]];
-#if defined(__AVX512F__) && !defined(__ARM_NEON)
+#if defined(MAFFT_AVX512)
 			__m512d vs0 = _mm512_set1_pd( s0 ), zero = _mm512_setzero_pd();
 			for( ; n+8<=gsize; n+=8 )
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ), VMULADD( vs0, _mm512_loadu_pd( v + n ), zero ), 8 );
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 			float64x2_t vs0 = vdupq_n_f64( s0 ), zero = vdupq_n_f64( 0.0 );
 			for( ; n+2<=gsize; n+=2 )
 			{
@@ -640,12 +613,12 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 		else if( cnt == 2 )
 		{
 			double s0 = scarr[let[0]], s1 = scarr[let[1]], *v1 = v + gsize;
-#if defined(__AVX512F__) && !defined(__ARM_NEON)
+#if defined(MAFFT_AVX512)
 			__m512d vs0 = _mm512_set1_pd( s0 ), vs1 = _mm512_set1_pd( s1 ), zero = _mm512_setzero_pd();
 			for( ; n+8<=gsize; n+=8 )
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ),
 				                      VMULADD( vs1, _mm512_loadu_pd( v1 + n ), VMULADD( vs0, _mm512_loadu_pd( v + n ), zero ) ), 8 );
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 			float64x2_t vs0 = vdupq_n_f64( s0 ), vs1 = vdupq_n_f64( s1 ), zero = vdupq_n_f64( 0.0 );
 			for( ; n+2<=gsize; n+=2 )
 			{
@@ -657,14 +630,14 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 		}
 		else
 		{
-#if defined(__AVX512F__) && !defined(__ARM_NEON)
+#if defined(MAFFT_AVX512)
 			for( ; n+8<=gsize; n+=8 )
 			{
 				__m512d acc = _mm512_setzero_pd();
 				for( k=0; k<cnt; k++ ) acc = VMULADD( _mm512_set1_pd( scarr[let[k]] ), _mm512_loadu_pd( v + (size_t)k*gsize + n ), acc );
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ), acc, 8 );
 			}
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 			for( ; n+2<=gsize; n+=2 )
 			{
 				float64x2_t acc = vdupq_n_f64( 0.0 );
@@ -1311,9 +1284,6 @@ static double Atracking( double *lasthorizontalw, double *lastverticalw,
 }
 
 
-#if defined(__ARM_NEON)
-#include <arm_neon.h>
-#endif
 /*
  * One row of the partA__align fill (trywarp == 0, USE_PENALTY_EX == 0), equivalent to the scalar
  * j-loop.  Every candidate for cell (i,j) comes from row i-1, and without the extension penalty
@@ -1363,7 +1333,7 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 		}
 		best = _mm512_cvtsd_f64( cv ); bi = _mm256_cvtsi256_si32( ck );
 	}
-#elif defined(__AVX512F__) && defined(__AVX512VL__)
+#elif defined(MAFFT_AVX512)
 	/* The running best as a prefix scan over (value, position) pairs, 8 at a time: a later pair
 	   replaces an earlier one only if its value is strictly greater (ties keep the earlier, as '>'), which is
 	   associative, so three shift+compare+blend steps (and the carry from the previous block)
@@ -1423,7 +1393,7 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 	}
 
 	j = 1;
-#if defined(__ARM_NEON) && MAFFT_STOCK_FMA /* vfmaq: fused, like the stock arm64 build */
+#if defined(MAFFT_A64) && MAFFT_STOCK_FMA /* vfmaq: fused, like the stock arm64 build */
 	{
 		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va );
 		int32x2_t vi = vdup_n_s32( i ), vi1 = vdup_n_s32( i-1 ), vzero = vdup_n_s32( 0 ), vtwo = vdup_n_s32( 2 );
@@ -1457,7 +1427,7 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 			vj = vadd_s32( vj, vtwo );
 		}
 	}
-#elif defined(__AVX512F__) && defined(__AVX512VL__)
+#elif defined(MAFFT_AVX512)
 	/* The same, 8 cells at a time; VMULADD rounds like MULADD. */
 	{
 		__m512d vgf1va = _mm512_set1_pd( gf1va ), vfgcp1va = _mm512_set1_pd( fgcp1va ), vogcp1va = _mm512_set1_pd( ogcp1va );
@@ -1526,7 +1496,7 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 			vj = _mm_add_epi32( vj, vfour );
 		}
 	}
-#elif defined(__ARM_NEON) && !defined(__APPLE__)
+#elif defined(MAFFT_A64) && !defined(__APPLE__)
 	/* The NEON block above for builds that do not fuse (gcc): NMULADD rounds like MULADD. */
 	{
 		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va );
