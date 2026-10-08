@@ -20,6 +20,8 @@ i1 = s.index('#else\n' + head, i0)
 body = s[i0:i1]
 assert body.count(head) == 1
 body = body.replace('if( lgth2 >= 7 )', 'if( Lfill_vec && lgth2 >= 7 )')
+assert body.count('needwm = ( maxwm <= ithr );') == 1
+body = body.replace('needwm = ( maxwm <= ithr );', 'needwm = !Lfill_vec || ( maxwm <= ithr );')
 body = body.replace(head, 'static int Lfill_vec = 1;\nstatic int Lfill_int_impl( double **amino_dynamicmtx,')
 n = 0
 for pat in ('for( ; j+3<=lgth2; j+=4 )', 'for( ; j+7<=lgth2; j+=8 )', 'for( ; j+15<=lgth2; j+=16 )', 'for( ; j+vl-1<=lgth2; j+=vl )', 'for( ; j+2*vl-1<=lgth2; j+=2*vl )'):
