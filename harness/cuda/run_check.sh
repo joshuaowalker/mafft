@@ -5,14 +5,15 @@
 #   ($SAMPLE), and the placement cases in $PLACE_DIR (case*/{mode,q.fasta,shard.aln.fasta}).
 # Each process appends its L11CHK line (pairs checked against the CPU L__align11, pairs left to
 # the CPU) to OUTDIR/l11chk.log; a mismatch aborts that run and is logged there too.  Outputs go
-# to OUTDIR/<case>.aln for comparison with a reference build.
+# to OUTDIR/<case>.aln for comparison with a reference build.  A build patched by avx2fma_check.py
+# logs to OUTDIR/avxchk.log the same way.
 set -u
 prefix=$1; out=$2; jobs=${3:-2}
 LINSI_DIR=${LINSI_DIR:-/work/mafft-canary-opt5/linsi}
 PLACE_DIR=${PLACE_DIR:-/work/mafft-canary-opt5/place}
 SAMPLE=${SAMPLE:-/work/src/cuda/test/sample}
-mkdir -p $out; rm -f $out/l11chk.log
-export L11CHK_LOG=$out/l11chk.log
+mkdir -p $out; rm -f $out/l11chk.log $out/avxchk.log
+export L11CHK_LOG=$out/l11chk.log AVXCHK_LOG=$out/avxchk.log
 {
   for f in $LINSI_DIR/*.fasta; do
     b=$(basename $f .fasta)
@@ -38,3 +39,4 @@ for d in $PLACE_DIR/case*/; do
 done
 echo "== $(grep -c '^L11CHK:' $out/l11chk.log) processes; mismatches: $(grep -c MISMATCH $out/l11chk.log); failures: $(grep -c FAILED $out/l11chk.log)"
 awk '/^L11CHK:/ { g += $2; c += $4; s += $6; x += $8 } END { printf "gpu-checked pairs %d, cpu-only pairs %d, of which no-alignment %d, cells %.4g\n", g, c, s, x }' $out/l11chk.log
+[ -s $out/avxchk.log ] && { echo "avx2fma: mismatches $(grep -c MISMATCH $out/avxchk.log)"; awk '/^AVXCHK/ && !/MISMATCH/ { k = ""; for( i=2; i<=NF; i++ ) { if( $i ~ /^[0-9]+$/ ) break; k = k " " $i } calls[k] += $i; if( $(i+2) ~ /^[0-9]+$/ ) cells[k] += $(i+2) } END { for( k in calls ) printf "  %s %d calls, %d cells, all identical\n", k, calls[k], cells[k] }' $out/avxchk.log; }
