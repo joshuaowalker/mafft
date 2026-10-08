@@ -14,6 +14,15 @@
 #define PACKMASK4(c) _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_castpd_si256( c ), _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 ) ) )
 #endif
 #endif
+#if defined(__ARM_NEON) && !defined(__APPLE__)
+#include <arm_neon.h>
+/* 2 x (a*b+c) rounded like MULADD (Linux arm64; the Apple build keeps its own NEON code) */
+#if MAFFT_STOCK_FMA
+#define NMULADD(a,b,c) vfmaq_f64( (c), (a), (b) )
+#else
+#define NMULADD(a,b,c) vaddq_f64( vmulq_f64( (a), (b) ), (c) )
+#endif
+#endif
 
 #define MACHIGAI 0
 #define OUTGAP0TRY 1
@@ -100,6 +109,27 @@ static void part_imp_match_out_vead_gapmap( double *imp, int i1, int lgth2, int 
 		{
 			__m512d g = _mm512_i32gather_pd( _mm256_loadu_si256( (__m256i *)( gapmap2 + j ) ), row, 8 );
 			_mm512_storeu_pd( imp + j, _mm512_add_pd( _mm512_loadu_pd( imp + j ), g ) );
+		}
+	}
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+	/* No gather on NEON: where gapmap2 maps 4 consecutive j to 4 consecutive columns (most of the
+	   time), two vector loads; otherwise the scalar adds.  The same add for every element. */
+	{
+		double *row = impmtx[i1] + start2;
+		const int32x4_t step = { 0, 1, 2, 3 };
+		for( ; j+4<=lgth2; j+=4 )
+		{
+			int g0 = gapmap2[j];
+			if( vminvq_u32( vceqq_s32( vld1q_s32( gapmap2 + j ), vaddq_s32( vdupq_n_s32( g0 ), step ) ) ) )
+			{
+				vst1q_f64( imp + j, vaddq_f64( vld1q_f64( imp + j ), vld1q_f64( row + g0 ) ) );
+				vst1q_f64( imp + j + 2, vaddq_f64( vld1q_f64( imp + j + 2 ), vld1q_f64( row + g0 + 2 ) ) );
+			}
+			else
+			{
+				imp[j] += row[gapmap2[j]]; imp[j+1] += row[gapmap2[j+1]];
+				imp[j+2] += row[gapmap2[j+2]]; imp[j+3] += row[gapmap2[j+3]];
+			}
 		}
 	}
 #endif
@@ -342,6 +372,30 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 			scarr[l] = s;
 		}
 	}
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+	/* The AVX2 block above, 2 letters at a time: only the letters present in column i1 (exact for
+	   the same reason), each lane's terms added in ascending j, rounded like MULADD. */
+	{
+		static TLS int *nzj = NULL, nzalloc = 0;
+		static TLS double *nzc = NULL;
+		int nz = 0;
+		if( nzalloc < nalphabets ) { free( nzj ); free( nzc ); nzalloc = nalphabets; nzj = malloc( sizeof( int ) * nzalloc ); nzc = malloc( sizeof( double ) * nzalloc ); }
+		for( j=0; j<nalphabets; j++ ) if( cpmx1[j][i1] != 0.0 ) { nzj[nz] = j; nzc[nz] = cpmx1[j][i1]; nz++; }
+		for( ; l+2<=nalphabets; l+=2 )
+		{
+			float64x2_t s = vdupq_n_f64( 0.0 );
+			for( k=0; k<nz; k++ )
+				s = NMULADD( vld1q_f64( n_dis_consweight_multi[nzj[k]] + l ), vdupq_n_f64( nzc[k] ), s );
+			vst1q_f64( scarr + l, s );
+		}
+		for( ; l<nalphabets; l++ ) /* an odd letter left over */
+		{
+			double s = 0.0;
+			for( k=0; k<nz; k++ )
+				s = MULADD( n_dis_consweight_multi[nzj[k]][l], nzc[k], s );
+			scarr[l] = s;
+		}
+	}
 #endif
 	for( ; l<nalphabets; l++ )
 	{
@@ -364,6 +418,13 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 			__m512d vs0 = _mm512_set1_pd( s0 ), zero = _mm512_setzero_pd();
 			for( ; n+8<=gsize; n+=8 )
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ), VMULADD( vs0, _mm512_loadu_pd( v + n ), zero ), 8 );
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+			float64x2_t vs0 = vdupq_n_f64( s0 ), zero = vdupq_n_f64( 0.0 );
+			for( ; n+2<=gsize; n+=2 )
+			{
+				float64x2_t r = NMULADD( vs0, vld1q_f64( v + n ), zero );
+				match[perm[n]] = vgetq_lane_f64( r, 0 ); match[perm[n+1]] = vgetq_lane_f64( r, 1 );
+			}
 #endif
 			for( ; n<gsize; n++ ) match[perm[n]] = MULADD( s0, v[n], 0.0 );
 		}
@@ -375,6 +436,13 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 			for( ; n+8<=gsize; n+=8 )
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ),
 				                      VMULADD( vs1, _mm512_loadu_pd( v1 + n ), VMULADD( vs0, _mm512_loadu_pd( v + n ), zero ) ), 8 );
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+			float64x2_t vs0 = vdupq_n_f64( s0 ), vs1 = vdupq_n_f64( s1 ), zero = vdupq_n_f64( 0.0 );
+			for( ; n+2<=gsize; n+=2 )
+			{
+				float64x2_t r = NMULADD( vs1, vld1q_f64( v1 + n ), NMULADD( vs0, vld1q_f64( v + n ), zero ) );
+				match[perm[n]] = vgetq_lane_f64( r, 0 ); match[perm[n+1]] = vgetq_lane_f64( r, 1 );
+			}
 #endif
 			for( ; n<gsize; n++ ) match[perm[n]] = MULADD( s1, v1[n], MULADD( s0, v[n], 0.0 ) );
 		}
@@ -386,6 +454,13 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 				__m512d acc = _mm512_setzero_pd();
 				for( k=0; k<cnt; k++ ) acc = VMULADD( _mm512_set1_pd( scarr[let[k]] ), _mm512_loadu_pd( v + (size_t)k*gsize + n ), acc );
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ), acc, 8 );
+			}
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+			for( ; n+2<=gsize; n+=2 )
+			{
+				float64x2_t acc = vdupq_n_f64( 0.0 );
+				for( k=0; k<cnt; k++ ) acc = NMULADD( vdupq_n_f64( scarr[let[k]] ), vld1q_f64( v + (size_t)k*gsize + n ), acc );
+				match[perm[n]] = vgetq_lane_f64( acc, 0 ); match[perm[n+1]] = vgetq_lane_f64( acc, 1 );
 			}
 #endif
 			for( ; n<gsize; n++ )
@@ -1123,6 +1198,41 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 			_mm256_storeu_pd( cur + j, _mm256_add_pd( _mm256_loadu_pd( cur + j ), wm ) );
 			_mm_storeu_si128( (__m128i *)( ijrow + j ), ij );
 			vj = _mm_add_epi32( vj, vfour );
+		}
+	}
+#elif defined(__ARM_NEON) && !defined(__APPLE__)
+	/* The NEON block above for builds that do not fuse (gcc): NMULADD rounds like MULADD. */
+	{
+		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va );
+		int32x2_t vi = vdup_n_s32( i ), vi1 = vdup_n_s32( i-1 ), vzero = vdup_n_s32( 0 ), vtwo = vdup_n_s32( 2 );
+		int32x2_t vj = { 1, 2 };
+		for( ; j+1<=lgth2; j+=2 )
+		{
+			float64x2_t p = vld1q_f64( prev + j - 1 );
+			float64x2_t wm, g1, g3, g4, mv;
+			uint64x2_t c;
+			int32x2_t ij, mpv;
+
+			g1 = NMULADD( vld1q_f64( fgcp2 + j - 1 ), vgf1va, vld1q_f64( MI + j ) );
+			c = vcgtq_f64( g1, p );
+			wm = vbslq_f64( c, g1, p );
+			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vld1_s32( MPI + j ), vj ), vzero );
+
+			mv = vld1q_f64( m + j );
+			mpv = vld1_s32( mp + j );
+			g3 = NMULADD( vfgcp1va, vld1q_f64( gapfreq2 + j ), mv );
+			c = vcgtq_f64( g3, wm );
+			wm = vbslq_f64( c, g3, wm );
+			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vi, mpv ), ij );
+
+			g4 = NMULADD( vogcp1va, vld1q_f64( gapfreq2 + j - 1 ), p );
+			c = vcgtq_f64( g4, mv );
+			vst1q_f64( m + j, vbslq_f64( c, g4, mv ) );
+			vst1_s32( mp + j, vbsl_s32( vmovn_u64( c ), vi1, mpv ) );
+
+			vst1q_f64( cur + j, vaddq_f64( vld1q_f64( cur + j ), wm ) );
+			vst1_s32( ijrow + j, ij );
+			vj = vadd_s32( vj, vtwo );
 		}
 	}
 #endif
