@@ -59,47 +59,16 @@ static void st_FinalGapCount( double *fgcp, int clus, char **seq, double *eff, i
 
 static TLS int impalloclen = 0;
 static TLS double **impmtx = NULL;
-#if defined(__linux__) && defined(MAFFT_A64)
-/*
- * impmtx in one block of transparent huge pages (Linux arm64): fillimp_track's walk touches a
- * different row, i.e. a different 4 KB page, at every step, so with separately allocated rows
- * most of its loads also miss the TLB.  Only the memory layout changes.
- */
-#include <stdint.h>
-extern int madvise( void *, size_t, int );
-static TLS char *impblock = NULL;
-static double **imp_alloc( int n )
-{
-	size_t huge = (size_t)2 << 20, bytes = (size_t)n * n * sizeof( double );
-	double **mtx = calloc( n + 1, sizeof( double * ) ), *base;
-	int i;
-	impblock = malloc( bytes + huge );
-	if( !mtx || !impblock ) ErrorExit( "Cannot allocate impmtx." );
-	base = (double *)( ( (uintptr_t)impblock + huge - 1 ) & ~(uintptr_t)( huge - 1 ) );
-	madvise( base, ( bytes + huge - 1 ) & ~( huge - 1 ), 14 /* MADV_HUGEPAGE */ );
-	for( i=0; i<n; i++ ) mtx[i] = base + (size_t)i * n;
-	mtx[n] = NULL;
-	return( mtx );
-}
-static void imp_free( double **mtx )
-{
-	free( impblock ); impblock = NULL;
-	free( mtx );
-}
-#define IMP_ALLOC( n ) imp_alloc( n )
-#define IMP_FREE( m ) imp_free( m )
-#endif
 static TLS int *improwlo = NULL, *improwhi = NULL;
 static TLS int impclean = 0; /* 1: impmtx is zero outside [improwlo[i],improwhi[i]] */
 
-#if defined(IMP_ALLOC)
-/* Linux arm64: the allocator above */
-#elif defined(MAFFT_AVX512X)
-/* The importance matrix as one block with a fixed row stride (fillimp_track walks it with
-   base + row * stride, see there), aligned to 2 MB and, on Linux, marked for transparent huge
-   pages: the fill touches cells in a different row at every step, and with 4 KB pages most of
-   those steps also missed the TLB.  Only the layout changes; every cell is read and written as
-   before. */
+/*
+ * The importance matrix as one block with a fixed row stride (a multiple of 8 doubles), aligned to
+ * 2 MB and, on Linux, marked for transparent huge pages: fillimp_track's walk touches a different
+ * row at every step, and with 4 KB pages most of those steps also missed the TLB; fillimp_track
+ * addresses the block from one base pointer.  Only the layout changes.  The block need not be
+ * cleared here: part_imp_match_init_strict zeroes the whole matrix before its first use.
+ */
 #if defined(__linux__)
 #ifndef MADV_HUGEPAGE
 #define MADV_HUGEPAGE 14
@@ -113,7 +82,7 @@ static double **imp_alloc( int n )
 	double **m = calloc( n+1, sizeof( double * ) );
 	char *a;
 	int i;
-	impblock = calloc( sz + huge, 1 );
+	impblock = malloc( sz + huge );
 	if( !m || !impblock ) ErrorExit( "Cannot allocate the importance matrix." );
 	a = (char *)( ( (uintptr_t)impblock + huge - 1 ) & ~(uintptr_t)( huge - 1 ) );
 #if defined(__linux__)
@@ -125,10 +94,6 @@ static double **imp_alloc( int n )
 static void imp_free( double **m ) { free( impblock ); impblock = NULL; free( m ); }
 #define IMP_ALLOC( n ) imp_alloc( n )
 #define IMP_FREE( m ) imp_free( m )
-#else
-#define IMP_ALLOC( n ) AllocateFloatMtx( n, n )
-#define IMP_FREE( m ) FreeFloatMtx( m )
-#endif
 double part_imp_match_out_sc( int i1, int j1 )
 {
 //	fprintf( stderr, "impalloclen = %d\n", impalloclen );
@@ -147,48 +112,33 @@ static void part_imp_match_out_vead_gapmap( double *imp, int i1, int lgth2, int 
 	while( lgth2-- )
 		*pt++ += impmtx[i1][start2+*gapmappt++];
 #else
-	int j = 0;
-#if defined(MAFFT_AVX512X)
 	/* With impclean, every cell of row i1 outside [improwlo, improwhi] is +0.0.  The columns
-	   start2+gapmap2[j] increase with j, so only one stretch of j reads the stored range; every
-	   other imp[j] gets the same + 0.0 the gather would have given it, without the gather. */
+	   start2+gapmap2[j] increase with j, so only one stretch [a, b) of j reads the stored range;
+	   every other imp[j] gets the same + 0.0 the gather would have given it, without the gather. */
+	double *row = impmtx[i1] + start2;
+	int j, a = 0, b = lgth2;
 	if( impclean && lgth2 > 0 )
 	{
-		double *row = impmtx[i1] + start2;
-		int lo = improwlo[i1] - start2, hi = improwhi[i1] - start2, a, b, m, jend;
-		const __m512d zero = _mm512_setzero_pd();
+		int lo = improwlo[i1] - start2, hi = improwhi[i1] - start2, m, jend;
 		/* a = first j with gapmap2[j] >= lo, b = first j with gapmap2[j] > hi */
 		for( a=0, b=lgth2; a<b; ) { m = ( a + b ) >> 1; if( gapmap2[m] < lo ) a = m + 1; else b = m; }
 		for( b=a, jend=lgth2; b<jend; ) { m = ( b + jend ) >> 1; if( gapmap2[m] <= hi ) b = m + 1; else jend = m; }
-		for( j=0; j+7<a; j+=8 ) _mm512_storeu_pd( imp + j, _mm512_add_pd( _mm512_loadu_pd( imp + j ), zero ) );
-		for( ; j<a; j++ ) imp[j] += 0.0;
-		for( ; j+7<b; j+=8 )
-		{
-			__m512d g = _mm512_i32gather_pd( _mm256_loadu_si256( (__m256i *)( gapmap2 + j ) ), row, 8 );
-			_mm512_storeu_pd( imp + j, _mm512_add_pd( _mm512_loadu_pd( imp + j ), g ) );
-		}
-		for( ; j<b; j++ ) imp[j] += row[gapmap2[j]];
-		for( ; j+7<lgth2; j+=8 ) _mm512_storeu_pd( imp + j, _mm512_add_pd( _mm512_loadu_pd( imp + j ), zero ) );
-		for( ; j<lgth2; j++ ) imp[j] += 0.0;
-		return;
+		for( j=0; j<a; j++ ) imp[j] += 0.0;
+		for( j=b; j<lgth2; j++ ) imp[j] += 0.0;
 	}
-#endif
+	j = a;
 #if defined(MAFFT_AVX512)
+	for( ; j+8<=b; j+=8 )
 	{
-		double *row = impmtx[i1] + start2;
-		for( ; j+7<lgth2; j+=8 )
-		{
-			__m512d g = _mm512_i32gather_pd( _mm256_loadu_si256( (__m256i *)( gapmap2 + j ) ), row, 8 );
-			_mm512_storeu_pd( imp + j, _mm512_add_pd( _mm512_loadu_pd( imp + j ), g ) );
-		}
+		__m512d g = _mm512_i32gather_pd( _mm256_loadu_si256( (__m256i *)( gapmap2 + j ) ), row, 8 );
+		_mm512_storeu_pd( imp + j, _mm512_add_pd( _mm512_loadu_pd( imp + j ), g ) );
 	}
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
+#elif defined(MAFFT_A64)
 	/* No gather on NEON: where gapmap2 maps 4 consecutive j to 4 consecutive columns (most of the
 	   time), two vector loads; otherwise the scalar adds.  The same add for every element. */
 	{
-		double *row = impmtx[i1] + start2;
 		const int32x4_t step = { 0, 1, 2, 3 };
-		for( ; j+4<=lgth2; j+=4 )
+		for( ; j+4<=b; j+=4 )
 		{
 			int g0 = gapmap2[j];
 			if( vminvq_u32( vceqq_s32( vld1q_s32( gapmap2 + j ), vaddq_s32( vdupq_n_s32( g0 ), step ) ) ) )
@@ -204,10 +154,7 @@ static void part_imp_match_out_vead_gapmap( double *imp, int i1, int lgth2, int 
 		}
 	}
 #endif
-	for( ; j<lgth2; j++ )
-	{
-		imp[j] += impmtx[i1][start2+gapmap2[j]];
-	}
+	for( ; j<b; j++ ) imp[j] += row[gapmap2[j]];
 #endif
 }
 
@@ -515,74 +462,7 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 	static TLS int scalloc = 0;
 	if( scalloc < nalphabets ) { free( mc_scarr ); scalloc = nalphabets; mc_scarr = malloc( sizeof( double ) * scalloc ); }
 	scarr = mc_scarr;
-	l = 0;
-#if defined(MAFFT_AVX512)
-	/* 8 letters at a time; each letter's sum still runs over j in order */
-	for( ; l+8<=nalphabets; l+=8 )
-	{
-		__m512d s = _mm512_setzero_pd();
-		for( j=0; j<nalphabets; j++ )
-			s = VMULADD( _mm512_loadu_pd( n_dis_consweight_multi[j] + l ), _mm512_set1_pd( cpmx1[j][i1] ), s );
-		_mm512_storeu_pd( scarr + l, s );
-	}
-#elif defined(MAFFT_AVX2_PATHS)
-	/* Only the letters present in column i1 contribute: s + (+-0) == s for every s the sum can
-	   hold (it starts at +0 and a sum is never -0 under round-to-nearest), so skipping the zero
-	   terms is exact (with FMA too: a*0 is an exact +-0).  The remaining terms are added in
-	   ascending j, 4 letters at a time, each lane rounded like MULADD (VMULADD4). */
-	{
-		static TLS int *nzj = NULL, nzalloc = 0;
-		static TLS double *nzc = NULL;
-		int nz = 0;
-		if( nzalloc < nalphabets ) { free( nzj ); free( nzc ); nzalloc = nalphabets; nzj = malloc( sizeof( int ) * nzalloc ); nzc = malloc( sizeof( double ) * nzalloc ); }
-		for( j=0; j<nalphabets; j++ ) if( cpmx1[j][i1] != 0.0 ) { nzj[nz] = j; nzc[nz] = cpmx1[j][i1]; nz++; }
-		for( ; l+4<=nalphabets; l+=4 )
-		{
-			__m256d s = _mm256_setzero_pd();
-			for( k=0; k<nz; k++ )
-				s = VMULADD4( _mm256_loadu_pd( n_dis_consweight_multi[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ), s );
-			_mm256_storeu_pd( scarr + l, s );
-		}
-		for( ; l<nalphabets; l++ )
-		{
-			double s = 0.0;
-			for( k=0; k<nz; k++ )
-				s = MULADD( n_dis_consweight_multi[nzj[k]][l], nzc[k], s );
-			scarr[l] = s;
-		}
-	}
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
-	/* The AVX2 block above, 2 letters at a time: only the letters present in column i1 (exact for
-	   the same reason), each lane's terms added in ascending j, rounded like MULADD. */
-	{
-		static TLS int *nzj = NULL, nzalloc = 0;
-		static TLS double *nzc = NULL;
-		int nz = 0;
-		if( nzalloc < nalphabets ) { free( nzj ); free( nzc ); nzalloc = nalphabets; nzj = malloc( sizeof( int ) * nzalloc ); nzc = malloc( sizeof( double ) * nzalloc ); }
-		for( j=0; j<nalphabets; j++ ) if( cpmx1[j][i1] != 0.0 ) { nzj[nz] = j; nzc[nz] = cpmx1[j][i1]; nz++; }
-		for( ; l+2<=nalphabets; l+=2 )
-		{
-			float64x2_t s = vdupq_n_f64( 0.0 );
-			for( k=0; k<nz; k++ )
-				s = NMULADD( vld1q_f64( n_dis_consweight_multi[nzj[k]] + l ), vdupq_n_f64( nzc[k] ), s );
-			vst1q_f64( scarr + l, s );
-		}
-		for( ; l<nalphabets; l++ ) /* an odd letter left over */
-		{
-			double s = 0.0;
-			for( k=0; k<nz; k++ )
-				s = MULADD( n_dis_consweight_multi[nzj[k]][l], nzc[k], s );
-			scarr[l] = s;
-		}
-	}
-#endif
-	for( ; l<nalphabets; l++ )
-	{
-		double s = 0.0;
-		for( j=0; j<nalphabets; j++ )
-			s = MULADD( n_dis_consweight_multi[j][l], cpmx1[j][i1], s );
-		scarr[l] = s;
-	}
+	scarr_fill( scarr, n_dis_consweight_multi, cpmx1, i1 );
 #if defined(MAFFT_AVX512X)
 	if( mcx_ok ) { mcx_apply( match, scarr, lgth2 ); return; }
 #endif
@@ -600,7 +480,7 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 			__m512d vs0 = _mm512_set1_pd( s0 ), zero = _mm512_setzero_pd();
 			for( ; n+8<=gsize; n+=8 )
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ), VMULADD( vs0, _mm512_loadu_pd( v + n ), zero ), 8 );
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
+#elif defined(MAFFT_A64)
 			float64x2_t vs0 = vdupq_n_f64( s0 ), zero = vdupq_n_f64( 0.0 );
 			for( ; n+2<=gsize; n+=2 )
 			{
@@ -618,7 +498,7 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 			for( ; n+8<=gsize; n+=8 )
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ),
 				                      VMULADD( vs1, _mm512_loadu_pd( v1 + n ), VMULADD( vs0, _mm512_loadu_pd( v + n ), zero ) ), 8 );
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
+#elif defined(MAFFT_A64)
 			float64x2_t vs0 = vdupq_n_f64( s0 ), vs1 = vdupq_n_f64( s1 ), zero = vdupq_n_f64( 0.0 );
 			for( ; n+2<=gsize; n+=2 )
 			{
@@ -637,7 +517,7 @@ static void mc_match( double *match, double **cpmx1, int i1, int lgth2 )
 				for( k=0; k<cnt; k++ ) acc = VMULADD( _mm512_set1_pd( scarr[let[k]] ), _mm512_loadu_pd( v + (size_t)k*gsize + n ), acc );
 				_mm512_i32scatter_pd( match, _mm256_loadu_si256( (__m256i *)( perm + n ) ), acc, 8 );
 			}
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
+#elif defined(MAFFT_A64)
 			for( ; n+2<=gsize; n+=2 )
 			{
 				float64x2_t acc = vdupq_n_f64( 0.0 );
@@ -852,18 +732,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
 	}
 
 	{
-#ifdef HAVE_SCARR_FILL
 		scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
-#else
-		for( l=0; l<nalphabets; l++ )
-		{
-			scarr[l] = 0.0;
-			for( j=0; j<nalphabets; j++ )
-//				scarr[l] += n_dis[j][l] * cpmx1[j][i1];
-//				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
-				scarr[l] += scoreingmtx[j][l] * cpmx1[j][i1];
-		}
-#endif
 		matchpt = match;
 		cpmxpdnptpt = cpmxpdn;
 		cpmxpdptpt = cpmxpd;
@@ -905,18 +774,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
 			cpmxpdn[count][j] = -1;
 		}
 	}
-#ifdef HAVE_SCARR_FILL
 	scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
-#else
-	for( l=0; l<nalphabets; l++ )
-	{
-		scarr[l] = 0.0;
-		for( k=0; k<nalphabets; k++ )
-//			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
-//			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
-			scarr[l] += scoreingmtx[k][l] * cpmx1[k][i1];
-	}
-#endif
 	for( j=0; j<lgth2; j++ )
 	{
 		match[j] = 0.0;
@@ -1393,7 +1251,8 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 	}
 
 	j = 1;
-#if defined(MAFFT_A64) && MAFFT_STOCK_FMA /* vfmaq: fused, like the stock arm64 build */
+#if defined(MAFFT_A64)
+	/* NMULADD rounds like MULADD: fused like the stock clang build, separate in a gcc build. */
 	{
 		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va );
 		int32x2_t vi = vdup_n_s32( i ), vi1 = vdup_n_s32( i-1 ), vzero = vdup_n_s32( 0 ), vtwo = vdup_n_s32( 2 );
@@ -1405,19 +1264,19 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 			uint64x2_t c;
 			int32x2_t ij, mpv;
 
-			g1 = vfmaq_f64( vld1q_f64( MI + j ), vld1q_f64( fgcp2 + j - 1 ), vgf1va );
+			g1 = NMULADD( vld1q_f64( fgcp2 + j - 1 ), vgf1va, vld1q_f64( MI + j ) );
 			c = vcgtq_f64( g1, p );
 			wm = vbslq_f64( c, g1, p );
 			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vld1_s32( MPI + j ), vj ), vzero );
 
 			mv = vld1q_f64( m + j );
 			mpv = vld1_s32( mp + j );
-			g3 = vfmaq_f64( mv, vfgcp1va, vld1q_f64( gapfreq2 + j ) );
+			g3 = NMULADD( vfgcp1va, vld1q_f64( gapfreq2 + j ), mv );
 			c = vcgtq_f64( g3, wm );
 			wm = vbslq_f64( c, g3, wm );
 			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vi, mpv ), ij );
 
-			g4 = vfmaq_f64( p, vogcp1va, vld1q_f64( gapfreq2 + j - 1 ) );
+			g4 = NMULADD( vogcp1va, vld1q_f64( gapfreq2 + j - 1 ), p );
 			c = vcgtq_f64( g4, mv );
 			vst1q_f64( m + j, vbslq_f64( c, g4, mv ) );
 			vst1_s32( mp + j, vbsl_s32( vmovn_u64( c ), vi1, mpv ) );
@@ -1494,41 +1353,6 @@ static void partA_row( int i, int lgth2, double *prev, double *cur, double *m, i
 			_mm256_storeu_pd( cur + j, _mm256_add_pd( _mm256_loadu_pd( cur + j ), wm ) );
 			_mm_storeu_si128( (__m128i *)( ijrow + j ), ij );
 			vj = _mm_add_epi32( vj, vfour );
-		}
-	}
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
-	/* The NEON block above for builds that do not fuse (gcc): NMULADD rounds like MULADD. */
-	{
-		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va );
-		int32x2_t vi = vdup_n_s32( i ), vi1 = vdup_n_s32( i-1 ), vzero = vdup_n_s32( 0 ), vtwo = vdup_n_s32( 2 );
-		int32x2_t vj = { 1, 2 };
-		for( ; j+1<=lgth2; j+=2 )
-		{
-			float64x2_t p = vld1q_f64( prev + j - 1 );
-			float64x2_t wm, g1, g3, g4, mv;
-			uint64x2_t c;
-			int32x2_t ij, mpv;
-
-			g1 = NMULADD( vld1q_f64( fgcp2 + j - 1 ), vgf1va, vld1q_f64( MI + j ) );
-			c = vcgtq_f64( g1, p );
-			wm = vbslq_f64( c, g1, p );
-			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vld1_s32( MPI + j ), vj ), vzero );
-
-			mv = vld1q_f64( m + j );
-			mpv = vld1_s32( mp + j );
-			g3 = NMULADD( vfgcp1va, vld1q_f64( gapfreq2 + j ), mv );
-			c = vcgtq_f64( g3, wm );
-			wm = vbslq_f64( c, g3, wm );
-			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vi, mpv ), ij );
-
-			g4 = NMULADD( vogcp1va, vld1q_f64( gapfreq2 + j - 1 ), p );
-			c = vcgtq_f64( g4, mv );
-			vst1q_f64( m + j, vbslq_f64( c, g4, mv ) );
-			vst1_s32( mp + j, vbsl_s32( vmovn_u64( c ), vi1, mpv ) );
-
-			vst1q_f64( cur + j, vaddq_f64( vld1q_f64( cur + j ), wm ) );
-			vst1_s32( ijrow + j, ij );
-			vj = vadd_s32( vj, vtwo );
 		}
 	}
 #endif

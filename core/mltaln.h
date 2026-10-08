@@ -45,12 +45,9 @@
 extern void cpmx_colmask( double **cpmx, int nalph, int lgth, unsigned int *mask );
 #endif
 
-/* scarr[l] = sum over j of mtx[j][l] * cpmx1[j][i1], added in ascending j from +0 (see mltaln9.c);
-   not in the AVX-512 builds of the contracting class, whose code predates it */
-#if defined(MAFFT_AVX2_PATHS) && !( MAFFT_STOCK_FMA && defined(MAFFT_AVX512) )
-#define HAVE_SCARR_FILL 1
+/* scarr[l] = sum over j of mtx[j][l] * cpmx1[j][i1], added in ascending j from +0, rounded like
+   MULADD (see mltaln9.c) */
 extern void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 );
-#endif
 
 #define FFT_THRESHOLD  80
 #define FFT_WINSIZE_P   20

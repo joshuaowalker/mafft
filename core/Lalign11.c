@@ -62,16 +62,12 @@ static void match_calc_bk( double *match, double **cpmx1, double **cpmx2, int i1
 		}
 	}
 
-#ifdef HAVE_SCARR_FILL
-	scarr_fill( scarr, n_dis, cpmx1, i1 );
-#else
 	for( l=0; l<nalphabets; l++ )
 	{
 		scarr[l] = 0.0;
 		for( k=0; k<nalphabets; k++ )
 			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
 	}
-#endif
 #if 0 /* �����Ȥ��Ȥ���doublework�Υ��������Ȥ�դˤ��� */
 	{
 		double *fpt, **fptpt, *fpt2;
@@ -99,13 +95,12 @@ static void match_calc_bk( double *match, double **cpmx1, double **cpmx2, int i1
 }
 #endif
 
-#if defined(MAFFT_AVX2) || ( defined(MAFFT_A64) && !defined(__APPLE__) )
+#if defined(MAFFT_AVX2) || defined(MAFFT_A64)
 /*
- * Used by every AVX2 build, AVX-512 builds included: on Zen 4 (c7a) this fill made L-INS-i
- * about 7% faster than the AVX-512 prefix-scan fill that AVX-512 builds used before (opt5).
- * The integer DP is the same under every rounding class, so MAFFT_STOCK_FMA does not matter
- * here.  arm64 builds other than Apple's (Linux on Graviton) use it too, with a NEON
- * loop; the Apple build keeps the prefix-scan fill (its all-pairs stage runs on the GPU).
+ * Used by every AVX2 build, AVX-512 builds included (on Zen 4 it made L-INS-i about 7% faster
+ * than the AVX-512 prefix-scan fill of opt5), and by every arm64 build, with a NEON or SVE loop
+ * (on the Apple build it serves the pairs the GPU does not take).  The integer DP is the same
+ * under every rounding class, so MAFFT_STOCK_FMA does not matter here.
  *
  * The AVX2 integer fill (Lfill_int below) does not compute the traceback offsets themselves.  A
  * cell whose best move is a horizontal gap stores LMARK_H, a vertical gap LMARK_V, and every DP
@@ -278,8 +273,7 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
  * consweight_multi == 1.0, integer penalties, scoreoffset == 0), the double DP below only ever
  * holds integers well inside 2^53, so an int32 DP makes exactly the same comparisons and yields
  * the same ijp[][], maxwm and end point.  Every candidate for cell (i,j) is derived from row i-1,
- * so a whole row, including the prefix scan for the horizontal-gap state, is computed 4 cells at
- * a time with NEON int32 vectors (scalar code for the last few cells).
+ * so a whole row can be computed several cells at a time.
  *
  * Returns 0 (and does nothing) when the integral/range preconditions do not hold.
  */
@@ -288,8 +282,8 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
  * Lfill_int for AVX2 (see LFILL_MARKS above): the same integer fill, 8 cells at a time, storing
  * LMARK_H / LMARK_V instead of gap offsets, so neither the first-index scan for the horizontal
  * state nor the vmp[] rows are needed.  Values, wm, the threshold clamp, ijp's 0 / lstop cells,
- * maxwm and the end point are computed exactly as in the original.  On Linux arm64 the same
- * loop runs 4 cells at a time with NEON, or svcntw() at a time with SVE when the vectors are at
+ * maxwm and the end point are computed exactly as in the original.  On arm64 the same loop
+ * runs 4 cells at a time with NEON, or svcntw() at a time with SVE when the vectors are at
  * least 256 bits wide (Graviton3); 128-bit SVE (Graviton4) uses the NEON loop.
  */
 #if defined(MAFFT_A64)
@@ -1173,70 +1167,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		rowmax = INT_MIN;
 		if( !profrow ) profrow = prof[u1[0]]; /* last row: cur[] is never read again */
 		j = 1;
-#if defined(MAFFT_A64)
-		{
-			int32x4_t vpen = vdupq_n_s32( pen ), vext = vdupq_n_s32( ext ), vthr = vdupq_n_s32( ithr );
-			int32x4_t vstop = vdupq_n_s32( lstop ), vi = vdupq_n_s32( i ), vi1 = vdupq_n_s32( negi1 );
-			int32x4_t vmax = vdupq_n_s32( INT_MIN ), vfour = vdupq_n_s32( 4 );
-			int32x4_t vj = { 1, 2, 3, 4 };
-			int32x4_t ninf = vdupq_n_s32( INT_MIN ), none = vdupq_n_s32( -1 );
-			int32x4_t cv = ninf, ck = vdupq_n_s32( 0 );
-			int32x4_t kv = { -1, 0, 1, 2 };
-			int32x4_t kext = vmulq_s32( kv, vext ), kext1 = vaddq_s32( kext, vext ), ext4 = vmulq_s32( vfour, vext );
-			for( ; j+3<=lgth2; j+=4 )
-			{
-				int32x4_t p = vld1q_s32( prev + j - 1 );
-				int32x4_t hqv, hkv;
-				{
-					int32x4_t v = vsubq_s32( vld1q_s32( prev + j - 2 ), kext );
-					int32x4_t x = vmaxq_s32( v, vextq_s32( ninf, v, 3 ) );
-					int32x4_t e, r, t;
-					x = vmaxq_s32( x, vextq_s32( ninf, x, 2 ) );
-					x = vmaxq_s32( x, cv );
-					e = vextq_s32( cv, x, 3 );
-					r = vbslq_s32( vcgtq_s32( v, e ), kv, none );
-					t = vmaxq_s32( r, vextq_s32( none, r, 3 ) );
-					t = vmaxq_s32( t, vextq_s32( none, t, 2 ) );
-					t = vmaxq_s32( t, ck );
-					hqv = vaddq_s32( x, kext1 );
-					hkv = t;
-					cv = vdupq_laneq_s32( x, 3 );
-					ck = vdupq_laneq_s32( t, 3 );
-					kv = vaddq_s32( kv, vfour );
-					kext = vaddq_s32( kext, ext4 );
-					kext1 = vaddq_s32( kext1, ext4 );
-				}
-				int32x4_t g, wm, ij, m, vmj, vmpj;
-				uint32x4_t c;
-				wm = p;
-				ij = vdupq_n_s32( 0 );
-				g = vaddq_s32( hqv, vpen );
-				c = vcgtq_s32( g, wm );
-				wm = vmaxq_s32( wm, g );
-				ij = vbslq_s32( c, vsubq_s32( hkv, vj ), ij );
-				vmj = vld1q_s32( vm + j );
-				vmpj = vld1q_s32( vmp + j );
-				g = vaddq_s32( vmj, vpen );
-				c = vcgtq_s32( g, wm );
-				wm = vmaxq_s32( wm, g );
-				ij = vbslq_s32( c, vsubq_s32( vi, vmpj ), ij );
-				c = vcgtq_s32( p, vmj );
-				m = vmaxq_s32( p, vmj );
-				vst1q_s32( vm + j, vaddq_s32( m, vext ) );
-				vst1q_s32( vmp + j, vbslq_s32( c, vi1, vmpj ) );
-				vst1q_s32( wmrow + j, wm );
-				vmax = vmaxq_s32( vmax, wm );
-				c = vcltq_s32( wm, vthr );
-				ij = vbslq_s32( c, vstop, ij );
-				wm = vmaxq_s32( wm, vthr );
-				vst1q_s32( ijrow + j, ij );
-				vst1q_s32( cur + j, vaddq_s32( wm, vld1q_s32( profrow + j ) ) );
-				vj = vaddq_s32( vj, vfour );
-			}
-			rowmax = vmaxvq_s32( vmax );
-			if( j > 1 ) { tbest = vgetq_lane_s32( cv, 0 ); tbestk = vgetq_lane_s32( ck, 0 ); }
-		}
-#elif defined(MAFFT_SSE41)
+#if defined(MAFFT_SSE41)
 		/* The NEON block above, lane for lane: palignr for vextq, pblendvb for vbslq. */
 		{
 			__m128i vpen = _mm_set1_epi32( pen ), vext = _mm_set1_epi32( ext ), vthr = _mm_set1_epi32( ithr );

@@ -11539,7 +11539,6 @@ void commongappick_record( int nseq, char **seq, int *map )
 		for( i=0; i<len; i++ ) keep[i] |= ( s[i] != '-' );
 	}
 	for( i=0, count=0; i<=len; i++ ) if( keep[i] ) map[count++] = i;
-#if defined(__x86_64__)
 	/* s[i] = s[map[i]] for ascending i, one run of kept columns at a time: map[] is increasing and
 	   map[i] >= i, so each run is a forward in-place move; nothing moves when no column is dropped. */
 	if( count < len + 1 )
@@ -11562,13 +11561,6 @@ void commongappick_record( int nseq, char **seq, int *map )
 		}
 		free( rs ); free( rl );
 	}
-#else
-	for( j=0; j<nseq; j++ )
-	{
-		char *s = seq[j];
-		for( i=0; i<count; i++ ) s[i] = s[map[i]];
-	}
-#endif
 	free( keep );
 }
 
@@ -16627,11 +16619,10 @@ static int makeresmap_avx512( char *seq, int *map )
 #define RESMAP_SLACK 0
 #endif
 
-#if defined(MAFFT_A64) && !defined(__APPLE__)
 /*
- * The segment walk of fillimp_track() in bands of FILLIMP_BAND rows of impmtx (Linux arm64).  The
- * walk touches about 1.7 billion cells per L-INS-i shard spread over a ~32 MB matrix; Graviton's
- * L2 (1-2 MB per core) holds a band of rows but not the matrix.  Every cell lies in exactly one
+ * The segment walk of fillimp_track() in bands of FILLIMP_BAND rows of impmtx.  The walk touches
+ * about 1.7 billion cells per L-INS-i shard spread over a ~32 MB matrix; a core's L2 (1-2 MB on
+ * Graviton, 1-2 MB on Zen 4/5 and Sapphire Rapids) holds a band of rows but not the matrix.  Every cell lies in exactly one
  * band, and within a band the segments are visited in the original (i, j, segment) order, so each
  * cell receives the same multiply-adds in the same order as in the original walk: impmtx is
  * bit-identical, and rowlo/rowhi (minima and maxima) are too.  Each segment keeps a cursor, as its
@@ -16641,8 +16632,9 @@ static int makeresmap_avx512( char *seq, int *map )
 #ifndef FILLIMP_BAND
 #define FILLIMP_BAND 128
 #endif
+#if FILLIMP_BAND > 0
 typedef struct { int *p1, *p2; int n, cur; double segimp, w; } fillimp_seg;
-static int fillimp_banded( double **impmtx, int clus1, int clus2, int lgth1, double *eff1, double *eff2, double *eff1_kozo, double *eff2_kozo, double effijx, LocalHom ***localhom, char *swaplist, int *orinum1, int *orinum2, int *rowlo, int *rowhi, int **map1, int **map2, int *nres1, int *nres2 )
+static int fillimp_banded( double **impmtx, double *base, size_t stride, int clus1, int clus2, int lgth1, double *eff1, double *eff2, double *eff1_kozo, double *eff2_kozo, double effijx, LocalHom ***localhom, char *swaplist, int *orinum1, int *orinum2, int *rowlo, int *rowhi, int **map1, int **map2, int *nres1, int *nres2 )
 {
 	int i, j, k, b, n, nseg = 0, nband, nlist, s1, e1, s2, e2, swap;
 	int *bstart, *bfill, *blist;
@@ -16710,12 +16702,26 @@ static int fillimp_banded( double **impmtx, int clus1, int clus2, int lgth1, dou
 			fillimp_seg *sg = seg + blist[l];
 			int *p1 = sg->p1, *p2 = sg->p2, cnt = sg->n;
 			double segimp = sg->segimp, w = sg->w;
-			for( n = sg->cur; n < cnt && p1[n] < bend; n++ )
+			if( stride )
 			{
-				int k1 = p1[n], k2 = p2[n];
-				impmtx[k1][k2] = MULADD( segimp, w, impmtx[k1][k2] );
-				if( k2 < rowlo[k1] ) rowlo[k1] = k2;
-				if( k2 > rowhi[k1] ) rowhi[k1] = k2;
+				for( n = sg->cur; n < cnt && p1[n] < bend; n++ )
+				{
+					int k1 = p1[n], k2 = p2[n];
+					double *cell = base + (size_t)k1 * stride + k2;
+					*cell = MULADD( segimp, w, *cell );
+					if( k2 < rowlo[k1] ) rowlo[k1] = k2;
+					if( k2 > rowhi[k1] ) rowhi[k1] = k2;
+				}
+			}
+			else
+			{
+				for( n = sg->cur; n < cnt && p1[n] < bend; n++ )
+				{
+					int k1 = p1[n], k2 = p2[n];
+					impmtx[k1][k2] = MULADD( segimp, w, impmtx[k1][k2] );
+					if( k2 < rowlo[k1] ) rowlo[k1] = k2;
+					if( k2 > rowhi[k1] ) rowhi[k1] = k2;
+				}
 			}
 			sg->cur = n;
 		}
@@ -16733,10 +16739,8 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 	double effij, effijx, effij_kozo, w, segimp;
 	int *pos1, *pos2, **map1, **map2, *nres1, *nres2;
 	LocalHom *tmpptr;
-#if defined(MAFFT_AVX512X)
 	double *fi_base;
 	size_t fi_stride;
-#endif
 
 	if( !rowlo )
 	{
@@ -16744,8 +16748,8 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 			impmtx[i][j] = 0.0;
 	}
 	effijx = 1.0 * fastathreshold;
-#if defined(MAFFT_AVX512X)
-	/* rows 0..lgth1-1 at a fixed stride from impmtx[0] (partSalignmm.c allocates it that way)? */
+	/* rows 0..lgth1-1 at a fixed stride from impmtx[0] (partSalignmm.c allocates it that way)?
+	   Then each cell is addressed from one base pointer instead of through its row pointer. */
 	{
 		fi_base = impmtx[0]; fi_stride = 0;
 		if( rowlo && lgth1 >= 2 && impmtx[1] > impmtx[0] )
@@ -16754,7 +16758,6 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 			for( i=2; i<lgth1 && fi_stride; i++ ) if( impmtx[i] != fi_base + (size_t)i * fi_stride ) fi_stride = 0;
 		}
 	}
-#endif
 
 	/* The original movereg() rescanned both gapped sequences from the start for every segment.
 	   Precompute residue->column maps once; the walk below visits the same (k1,k2) cells in the
@@ -16766,8 +16769,8 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 	for( i=0; i<clus1; i++ ) { map1[i] = malloc( ( lgth1 + 1 + RESMAP_SLACK ) * sizeof( int ) ); nres1[i] = makeresmap( seq1[i], map1[i] ); }
 	for( j=0; j<clus2; j++ ) { map2[j] = malloc( ( lgth2 + 1 + RESMAP_SLACK ) * sizeof( int ) ); nres2[j] = makeresmap( seq2[j], map2[j] ); }
 
-#if defined(MAFFT_A64) && !defined(__APPLE__)
-	if( fillimp_banded( impmtx, clus1, clus2, lgth1, eff1, eff2, eff1_kozo, eff2_kozo, effijx, localhom, swaplist, orinum1, orinum2, rowlo, rowhi, map1, map2, nres1, nres2 ) )
+#if FILLIMP_BAND > 0
+	if( fillimp_banded( impmtx, fi_base, fi_stride, clus1, clus2, lgth1, eff1, eff2, eff1_kozo, eff2_kozo, effijx, localhom, swaplist, orinum1, orinum2, rowlo, rowhi, map1, map2, nres1, nres2 ) )
 		goto fillimp_done;
 #endif
 	for( i=0; i<clus1; i++ )
@@ -16816,7 +16819,6 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 				}
 
 				nlim = MIN( e1 - s1, e2 - s2 );
-#if defined(MAFFT_AVX512X)
 				if( rowlo && fi_stride )
 				{
 					/* the loop below, addressing the cell from one base pointer */
@@ -16830,9 +16832,7 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 						if( k2 > rowhi[k1] ) rowhi[k1] = k2;
 					}
 				}
-				else
-#endif
-				if( rowlo )
+				else if( rowlo )
 				{
 					for( n=0; n<=nlim; n++ )
 					{
@@ -16853,7 +16853,7 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 			}
 		}
 	}
-#if defined(MAFFT_A64) && !defined(__APPLE__)
+#if FILLIMP_BAND > 0
 fillimp_done:
 #endif
 	for( i=0; i<clus1; i++ ) free( map1[i] );
@@ -17458,23 +17458,22 @@ void fillimp_file( double **impmtx, double *imp, int clus1, int clus2, int lgth1
 }
 
 
-#if defined(HAVE_SCARR_FILL)
 /*
  * The profile-score vector every match_calc builds:  for each l, scarr[l] = 0.0 and then
  * scarr[l] += mtx[j][l] * cpmx1[j][i1] for j = 0 .. nalphabets-1.  Only the letters present in
  * column i1 contribute: s + (+-0) == s for every value the sum can hold (it starts at +0 and a
- * sum is never -0 under round-to-nearest), so the zero terms are skipped exactly.  The rest are
- * added in the same ascending j, 4 letters at a time, each lane with its own multiply then add
- * in a build that does not contract a*b+c, or with one fused multiply-add (the a*0 of a skipped
- * term is an exact +-0 there too) in the contracting class (MAFFT_STOCK_FMA, clang on an FMA
- * target), which compiles the stock statement to fma( mtx[j][l], cpmx1[j][i1], scarr[l] ) --
- * bit-identical to the scalar loop either way.
+ * sum is never -0 under round-to-nearest), so the zero terms are skipped exactly; with a fused
+ * multiply-add, the a*0 of a skipped term is an exact +-0 too.  The rest are added in the same
+ * ascending j, several letters at a time, each lane rounded like MULADD -- separately in a build
+ * that does not contract a*b+c, fused where the stock build compiles the statement to
+ * fma( mtx[j][l], cpmx1[j][i1], scarr[l] ) (MAFFT_STOCK_FMA) -- so the result is bit-identical
+ * to the scalar loop in either rounding class.
  */
 void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 )
 {
 	static TLS int *nzj = NULL, nzalloc = 0;
 	static TLS double *nzc = NULL;
-	int j, k, l, nz = 0;
+	int j, k, l = 0, nz = 0;
 	if( nzalloc < nalphabets )
 	{
 		free( nzj ); free( nzc );
@@ -17483,22 +17482,33 @@ void scarr_fill( double *scarr, double **mtx, double **cpmx1, int i1 )
 		nzc = malloc( sizeof( double ) * nzalloc );
 	}
 	for( j=0; j<nalphabets; j++ ) if( cpmx1[j][i1] != 0.0 ) { nzj[nz] = j; nzc[nz] = cpmx1[j][i1]; nz++; }
-	for( l=0; l+4<=nalphabets; l+=4 )
+#if defined(MAFFT_AVX512)
+	for( ; l+8<=nalphabets; l+=8 )
+	{
+		__m512d s = _mm512_setzero_pd();
+		for( k=0; k<nz; k++ ) s = VMULADD( _mm512_loadu_pd( mtx[nzj[k]] + l ), _mm512_set1_pd( nzc[k] ), s );
+		_mm512_storeu_pd( scarr + l, s );
+	}
+#endif
+#if defined(MAFFT_AVX2_PATHS)
+	for( ; l+4<=nalphabets; l+=4 )
 	{
 		__m256d s = _mm256_setzero_pd();
-		for( k=0; k<nz; k++ )
-#if MAFFT_STOCK_FMA
-			s = _mm256_fmadd_pd( _mm256_loadu_pd( mtx[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ), s );
-#else
-			s = _mm256_add_pd( s, _mm256_mul_pd( _mm256_loadu_pd( mtx[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ) ) );
-#endif
+		for( k=0; k<nz; k++ ) s = VMULADD4( _mm256_loadu_pd( mtx[nzj[k]] + l ), _mm256_set1_pd( nzc[k] ), s );
 		_mm256_storeu_pd( scarr + l, s );
 	}
+#elif defined(MAFFT_A64)
+	for( ; l+2<=nalphabets; l+=2 )
+	{
+		float64x2_t s = vdupq_n_f64( 0.0 );
+		for( k=0; k<nz; k++ ) s = NMULADD( vld1q_f64( mtx[nzj[k]] + l ), vdupq_n_f64( nzc[k] ), s );
+		vst1q_f64( scarr + l, s );
+	}
+#endif
 	for( ; l<nalphabets; l++ )
 	{
 		double s = 0.0;
-		for( k=0; k<nz; k++ ) s += mtx[nzj[k]][l] * nzc[k];
+		for( k=0; k<nz; k++ ) s = MULADD( mtx[nzj[k]][l], nzc[k], s );
 		scarr[l] = s;
 	}
 }
-#endif

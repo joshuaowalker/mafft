@@ -31,16 +31,12 @@ static void match_calc( double *match, double **cpmx1, double **cpmx2, int i1, i
 		}
 	}
 
-#ifdef HAVE_SCARR_FILL
-	scarr_fill( scarr, n_dis, cpmx1, i1 );
-#else
 	for( l=0; l<nalphabets; l++ )
 	{
 		scarr[l] = 0.0;
 		for( k=0; k<nalphabets; k++ )
 			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
 	}
-#endif
 	for( j=0; j<lgth2; j++ )
 	{
 		match[j] = 0;

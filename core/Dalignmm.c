@@ -274,18 +274,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
 	}
 
 	{
-#ifdef HAVE_SCARR_FILL
 		scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
-#else
-		for( l=0; l<nalphabets; l++ )
-		{
-			scarr[l] = 0.0;
-			for( j=0; j<nalphabets; j++ )
-//				scarr[l] += n_dis[j][l] * cpmx1[j][i1];
-//				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
-				scarr[l] += scoreingmtx[j][l] * cpmx1[j][i1];
-		}
-#endif
 		matchpt = match;
 		cpmxpdnptpt = cpmxpdn;
 		cpmxpdptpt = cpmxpd;
@@ -327,18 +316,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
 			cpmxpdn[count][j] = -1;
 		}
 	}
-#ifdef HAVE_SCARR_FILL
 	scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
-#else
-	for( l=0; l<nalphabets; l++ )
-	{
-		scarr[l] = 0.0;
-		for( k=0; k<nalphabets; k++ )
-//			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
-//			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
-			scarr[l] += scoreingmtx[k][l] * cpmx1[k][i1];
-	}
-#endif
 	for( j=0; j<lgth2; j++ )
 	{
 		match[j] = 0.0;
@@ -381,18 +359,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
 	}
 
 	{
-#ifdef HAVE_SCARR_FILL
 		scarr_fill( scarr, n_dynamicmtx, cpmx1, i1 );
-#else
-		for( l=0; l<nalphabets; l++ )
-		{
-			scarr[l] = 0.0;
-			for( j=0; j<nalphabets; j++ )
-//				scarr[l] += n_dis[j][l] * cpmx1[j][i1];
-//				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
-				scarr[l] += n_dynamicmtx[j][l] * cpmx1[j][i1];
-		}
-#endif
 		matchpt = match;
 		cpmxpdnptpt = cpmxpdn;
 		cpmxpdptpt = cpmxpd;
@@ -434,18 +401,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
 			cpmxpdn[count][j] = -1;
 		}
 	}
-#ifdef HAVE_SCARR_FILL
 	scarr_fill( scarr, n_dynamicmtx, cpmx1, i1 );
-#else
-	for( l=0; l<nalphabets; l++ )
-	{
-		scarr[l] = 0.0;
-		for( k=0; k<nalphabets; k++ )
-//			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
-//			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
-			scarr[l] += n_dynamicmtx[k][l] * cpmx1[k][i1];
-	}
-#endif
 	for( j=0; j<lgth2; j++ )
 	{
 		match[j] = 0.0;

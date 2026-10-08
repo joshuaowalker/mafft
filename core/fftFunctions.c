@@ -1,5 +1,5 @@
 #include "mltaln.h"
-#if defined(MAFFT_A64) && !defined(__APPLE__)
+#if defined(MAFFT_A64)
 /* One bit (bit 4t) per byte t of x that differs from every byte of the masks OR-ed into eq. */
 #define NEON_NIBBLES( eq ) ( ~vget_lane_u64( vreinterpret_u64_u8( vshrn_n_u16( vreinterpretq_u16_u8( eq ), 4 ) ), 0 ) & 0x1111111111111111ULL )
 /*
@@ -330,7 +330,7 @@ int alignableReagion( int    clus1, int    clus2,
 				for( ; i<len; i++ ) seenc[s[i]] = 1;
 			}
 		}
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
+#elif defined(MAFFT_A64)
 		/* The AVX-512BW block above, 16 bytes at a time (Linux arm64). */
 		{
 			static const unsigned char common[] = "-acgtACGT";
@@ -467,7 +467,7 @@ int alignableReagion( int    clus1, int    clus2,
 				for( ; i<len; i++ ) { int ci = cidx[s[i]]; if( ci >= 0 ) cp[i*nu+ci] += e; }
 			}
 			if( cidx['-'] >= 0 )
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
+#elif defined(MAFFT_A64)
 			/* the same adds in the same order, visiting only the non-gap bytes (when '-' has no bin) */
 			for( j=0; j<clus1+clus2 && cidx['-'] < 0; j++ )
 			{

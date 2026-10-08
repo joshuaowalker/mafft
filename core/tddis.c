@@ -229,7 +229,7 @@ void cpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus )
 	(void)seqpt;
 }
 #else
-#if defined(MAFFT_A64) && !defined(__APPLE__)
+#if defined(MAFFT_A64)
 	/* 16 columns at a time where they are all gaps: one row of cpmx, 8 vector adds.  Each
 	   element receives the same additions in the same order (Linux arm64). */
 	{

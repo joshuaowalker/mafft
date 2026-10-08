@@ -233,18 +233,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
 	}
 
 	{
-#ifdef HAVE_SCARR_FILL
 		scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
-#else
-		for( l=0; l<nalphabets; l++ )
-		{
-			scarr[l] = 0.0;
-			for( j=0; j<nalphabets; j++ )
-//				scarr[l] += n_dis[j][l] * cpmx1[j][i1];
-//				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
-				scarr[l] += scoreingmtx[j][l] * cpmx1[j][i1];
-		}
-#endif
 		matchpt = match;
 		cpmxpdnptpt = cpmxpdn;
 		cpmxpdptpt = cpmxpd;
@@ -286,18 +275,7 @@ static void match_calc_add( double **scoreingmtx, double *match, double **cpmx1,
 			cpmxpdn[count][j] = -1;
 		}
 	}
-#ifdef HAVE_SCARR_FILL
 	scarr_fill( scarr, scoreingmtx, cpmx1, i1 );
-#else
-	for( l=0; l<nalphabets; l++ )
-	{
-		scarr[l] = 0.0;
-		for( k=0; k<nalphabets; k++ )
-//			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
-//			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
-			scarr[l] += scoreingmtx[k][l] * cpmx1[k][i1];
-	}
-#endif
 	for( j=0; j<lgth2; j++ )
 	{
 		match[j] = 0.0;
@@ -361,18 +339,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
 	}
 
 	{
-#ifdef HAVE_SCARR_FILL
 		scarr_fill( scarr, n_dynamicmtx, cpmx1, i1 );
-#else
-		for( l=0; l<nalphabets; l++ )
-		{
-			scarr[l] = 0.0;
-			for( j=0; j<nalphabets; j++ )
-//				scarr[l] += n_dis[j][l] * cpmx1[j][i1];
-//				scarr[l] += n_dis_consweight_multi[j][l] * cpmx1[j][i1];
-				scarr[l] += n_dynamicmtx[j][l] * cpmx1[j][i1];
-		}
-#endif
 		matchpt = match;
 		cpmxpdnptpt = cpmxpdn;
 		cpmxpdptpt = cpmxpd;
@@ -414,18 +381,7 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
 			cpmxpdn[count][j] = -1;
 		}
 	}
-#ifdef HAVE_SCARR_FILL
 	scarr_fill( scarr, n_dynamicmtx, cpmx1, i1 );
-#else
-	for( l=0; l<nalphabets; l++ )
-	{
-		scarr[l] = 0.0;
-		for( k=0; k<nalphabets; k++ )
-//			scarr[l] += n_dis[k][l] * cpmx1[k][i1];
-//			scarr[l] += n_dis_consweight_multi[k][l] * cpmx1[k][i1];
-			scarr[l] += n_dynamicmtx[k][l] * cpmx1[k][i1];
-	}
-#endif
 	for( j=0; j<lgth2; j++ )
 	{
 		match[j] = 0.0;
@@ -1200,7 +1156,8 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 	}
 
 	j = 1;
-#if defined(MAFFT_A64) && MAFFT_STOCK_FMA /* vfmaq: fused, like the stock arm64 build */
+#if defined(MAFFT_A64)
+	/* NMULADD rounds like MULADD: fused like the stock clang build, separate in a gcc build. */
 	{
 		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va ), vext = vdupq_n_f64( ext );
 		int32x2_t vi = vdup_n_s32( i ), vi1 = vdup_n_s32( i-1 ), vzero = vdup_n_s32( 0 ), vtwo = vdup_n_s32( 2 );
@@ -1212,19 +1169,19 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 			uint64x2_t c;
 			int32x2_t ij, mpv;
 
-			g1 = vfmaq_f64( vld1q_f64( MI + j ), vld1q_f64( fgcp2 + j - 1 ), vgf1va );
+			g1 = NMULADD( vld1q_f64( fgcp2 + j - 1 ), vgf1va, vld1q_f64( MI + j ) );
 			c = vcgtq_f64( g1, p );
 			wm = vbslq_f64( c, g1, p );
 			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vld1_s32( MPI + j ), vj ), vzero );
 
 			mv = vld1q_f64( m + j );
 			mpv = vld1_s32( mp + j );
-			g3 = vfmaq_f64( mv, vfgcp1va, vld1q_f64( gf2 + j ) );
+			g3 = NMULADD( vfgcp1va, vld1q_f64( gf2 + j ), mv );
 			c = vcgtq_f64( g3, wm );
 			wm = vbslq_f64( c, g3, wm );
 			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vi, mpv ), ij );
 
-			g4 = vfmaq_f64( p, vogcp1va, vld1q_f64( gf2 + j - 1 ) );
+			g4 = NMULADD( vogcp1va, vld1q_f64( gf2 + j - 1 ), p );
 			c = vcgeq_f64( g4, mv );
 			vst1q_f64( m + j, vaddq_f64( vbslq_f64( c, g4, mv ), vext ) );
 			vst1_s32( mp + j, vbsl_s32( vmovn_u64( c ), vi1, mpv ) );
@@ -1301,41 +1258,6 @@ static void A_row( int i, int lgth2, double *prev, double *cur, double *m, int *
 			_mm256_storeu_pd( cur + j, _mm256_add_pd( _mm256_loadu_pd( cur + j ), wm ) );
 			_mm_storeu_si128( (__m128i *)( ijrow + j ), ij );
 			vj = _mm_add_epi32( vj, vfour );
-		}
-	}
-#elif defined(MAFFT_A64) && !defined(__APPLE__)
-	/* The NEON block above for builds that do not fuse (gcc): NMULADD rounds like MULADD. */
-	{
-		float64x2_t vgf1va = vdupq_n_f64( gf1va ), vfgcp1va = vdupq_n_f64( fgcp1va ), vogcp1va = vdupq_n_f64( ogcp1va ), vext = vdupq_n_f64( ext );
-		int32x2_t vi = vdup_n_s32( i ), vi1 = vdup_n_s32( i-1 ), vzero = vdup_n_s32( 0 ), vtwo = vdup_n_s32( 2 );
-		int32x2_t vj = { 1, 2 };
-		for( ; j+1<=lgth2; j+=2 )
-		{
-			float64x2_t p = vld1q_f64( prev + j - 1 );
-			float64x2_t wm, g1, g3, g4, mv;
-			uint64x2_t c;
-			int32x2_t ij, mpv;
-
-			g1 = NMULADD( vld1q_f64( fgcp2 + j - 1 ), vgf1va, vld1q_f64( MI + j ) );
-			c = vcgtq_f64( g1, p );
-			wm = vbslq_f64( c, g1, p );
-			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vld1_s32( MPI + j ), vj ), vzero );
-
-			mv = vld1q_f64( m + j );
-			mpv = vld1_s32( mp + j );
-			g3 = NMULADD( vfgcp1va, vld1q_f64( gf2 + j ), mv );
-			c = vcgtq_f64( g3, wm );
-			wm = vbslq_f64( c, g3, wm );
-			ij = vbsl_s32( vmovn_u64( c ), vsub_s32( vi, mpv ), ij );
-
-			g4 = NMULADD( vogcp1va, vld1q_f64( gf2 + j - 1 ), p );
-			c = vcgeq_f64( g4, mv );
-			vst1q_f64( m + j, vaddq_f64( vbslq_f64( c, g4, mv ), vext ) );
-			vst1_s32( mp + j, vbsl_s32( vmovn_u64( c ), vi1, mpv ) );
-
-			vst1q_f64( cur + j, vaddq_f64( vld1q_f64( cur + j ), wm ) );
-			vst1_s32( ijrow + j, ij );
-			vj = vadd_s32( vj, vtwo );
 		}
 	}
 #endif
