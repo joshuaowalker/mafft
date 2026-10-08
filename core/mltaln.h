@@ -56,6 +56,19 @@
 #define MULADD(a,b,c) ( (a)*(b) + (c) )
 #endif
 
+/* x86 kernels for AVX-512 CPUs that also have VPOPCNTDQ and VBMI2 (Intel Ice Lake and later, AMD
+   Zen 4 and later), written on Zen 5 and Granite Rapids.  -march=x86-64-v4 includes neither, so a
+   build with it alone compiles exactly the code it did before; select these kernels with, for
+   example, -march=x86-64-v4 -mavx512vpopcntdq -mavx512vbmi2, or -march=znver4, znver5,
+   icelake-server, sapphirerapids or graniterapids. */
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VL__) && defined(__AVX512VPOPCNTDQ__) && defined(__AVX512VBMI2__) && !defined(__ARM_NEON)
+#define MAFFT_AVX512X 1
+#endif
+#if defined(MAFFT_AVX512X)
+/* bit l of mask[j] = ( cpmx[l][j] != 0 ) for l < nalph <= 32 (mltaln9.c) */
+extern void cpmx_colmask( double **cpmx, int nalph, int lgth, unsigned int *mask );
+#endif
+
 /* scarr[l] = sum over j of mtx[j][l] * cpmx1[j][i1], added in ascending j from +0 (see mltaln9.c) */
 #if defined(__AVX2__) && !defined(__ARM_NEON) && !MAFFT_STOCK_FMA
 #define HAVE_SCARR_FILL 1

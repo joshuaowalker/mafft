@@ -1,4 +1,7 @@
 #include "mltaln.h"
+#if defined(MAFFT_AVX512X)
+#include <immintrin.h>
+#endif
 
 #define DEBUG 0
 #define USEDISTONTREE 1
@@ -196,6 +199,39 @@ void cpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus )
 		while( i-- )
 			*cpmxpt++ = 0.0;
 	}
+#if defined(MAFFT_AVX512X)
+	/* 64 columns at a time: for each character c of the block, the columns holding it get feff
+	   added in cpmx's row for c, 8 at a time under a mask; every cell still receives one addition
+	   per sequence, in sequence order. */
+	for( k=0; k<clus; k++ )
+	{
+		__m512d vf = _mm512_set1_pd( (double)eff[k] );
+		unsigned char *s = (unsigned char *)seq[k];
+		feff = (double)eff[k];
+		for( j=0; j+64<=lgth; j+=64 )
+		{
+			__m512i x = _mm512_loadu_si512( (void *)( s + j ) );
+			unsigned long long rest = ~0ULL;
+			while( rest )
+			{
+				unsigned char c = s[j+__builtin_ctzll( rest )];
+				unsigned long long m = _mm512_cmpeq_epi8_mask( x, _mm512_set1_epi8( (char)c ) ) & rest;
+				double *row = cpmx[(unsigned char)amino_n[c]] + j;
+				int q;
+				rest &= ~m;
+				for( q=0; q<8; q++ )
+				{
+					__mmask8 m8 = (__mmask8)( m >> ( 8 * q ) );
+					_mm512_mask_storeu_pd( row + 8 * q, m8, _mm512_add_pd( _mm512_maskz_loadu_pd( m8, row + 8 * q ), vf ) );
+				}
+			}
+		}
+		for( ; j<lgth; j++ )
+			cpmx[(unsigned char)amino_n[s[j]]][j] += feff;
+	}
+	(void)seqpt;
+}
+#else
 	for( k=0; k<clus; k++ )
 	{
 		feff = (double)eff[k];
@@ -207,6 +243,7 @@ void cpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus )
 		}
 	}
 }
+#endif
 void MScpmx_calc_new( char **seq, double **cpmx, double *eff, int lgth, int clus ) // summ eff must be 1.0
 {
 	int  i, j, k;

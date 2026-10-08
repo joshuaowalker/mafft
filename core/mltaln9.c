@@ -560,6 +560,279 @@ static int igs_prep( char *seq, int len, int *nxt, igs_run *runs, int *nrun )
 	return( 1 );
 }
 
+#if defined(MAFFT_AVX512X)
+#include <stdint.h>
+/*
+ * igs_pairscores() with bit masks.  Each row is read 64 columns at a time into a gap mask and
+ * one mask per common letter (the IGSX_NC most frequent letters of its group that make up at
+ * least 1/64 of the group's residues; DNA: a, c, g, t).  The column sum of a pair, the integer
+ * sum over columns of dzi[a][b] (0 where either is a gap), is
+ *   sum over common pairs (a, b) of dzi[a][b] * popcount( mask1_a & mask2_b )
+ *   + for each rare letter a of row i at column k: dzi[a][seq2_j[k]]
+ *   + for each rare letter b of row j at column k where row i has a common letter c: dzi[c][b],
+ * which counts every column once, summed exactly in 64 bits.  The gap stretches and "first
+ * residue column at or after k" come from the gap masks, and the gap terms are added to the pair
+ * score exactly as in igs_pairscores(), in the same order.  Returns 0 (nothing written) when a
+ * row is not exactly len 7-bit characters, a group has more than IGSX_MAXL letters, or the rare
+ * letters are too many to be worth it; igs_pairscores() then runs as before.
+ */
+#define IGSX_MAXL 32
+#define IGSX_NC 6
+typedef struct { int row, col, c; } igsx_rare;
+
+static int igsx_nxt( uint64_t *g, int nw, int len, int k )
+{
+	int w = k >> 6;
+	uint64_t m = ~g[w] & ( ~0ULL << ( k & 63 ) );
+	while( !m )
+	{
+		if( ++w >= nw ) return( len );
+		m = ~g[w];
+	}
+	k = ( w << 6 ) + __builtin_ctzll( m );
+	return( k < len ? k : len );
+}
+
+static uint64_t igsx_lenmask( int len, int w )
+{
+	return( ( len - w * 64 >= 64 ) ? ~0ULL : ( ( 1ULL << ( len - w * 64 ) ) - 1 ) );
+}
+
+/* pass 1 over a group: checks the rows (len 7-bit characters, then NUL) and counts each letter */
+static int igsx_count( char **seq, int n, int len, unsigned char *let, long *cnt, int *nlet )
+{
+	int r, w, q, nw = ( len + 63 ) / 64;
+	const __m512i dash = _mm512_set1_epi8( '-' );
+	__m512i lv[IGSX_MAXL];
+	*nlet = 0;
+	for( r=0; r<n; r++ )
+	{
+		unsigned char *s = (unsigned char *)seq[r];
+		if( s[len] != 0 ) return( 0 );
+		for( w=0; w<nw; w++ )
+		{
+			uint64_t lm = igsx_lenmask( len, w ), seen, rest;
+			__m512i x = _mm512_maskz_loadu_epi8( lm, (void *)( s + w * 64 ) );
+			seen = _mm512_cmpeq_epi8_mask( x, dash );
+			for( q=0; q<*nlet; q++ ) { uint64_t m = _mm512_cmpeq_epi8_mask( x, lv[q] ); cnt[q] += __builtin_popcountll( m & lm ); seen |= m; }
+			rest = ~seen & lm;
+			while( rest )
+			{
+				unsigned char c = s[w*64+__builtin_ctzll( rest )];
+				uint64_t m;
+				if( c == 0 || c >= 0x80 || *nlet >= IGSX_MAXL ) return( 0 );
+				q = (*nlet)++;
+				let[q] = c; lv[q] = _mm512_set1_epi8( (char)c );
+				m = _mm512_cmpeq_epi8_mask( x, lv[q] ) & lm;
+				cnt[q] = __builtin_popcountll( m );
+				rest &= ~m;
+			}
+		}
+	}
+	return( 1 );
+}
+
+/* the common letters of a group: the most frequent first, at most IGSX_NC, each at least 1/64 of the residues */
+static int igsx_common( unsigned char *let, long *cnt, int nlet, unsigned char *com, unsigned char *iscom )
+{
+	int q, k, nc = 0, used[IGSX_MAXL];
+	long tot = 0;
+	for( q=0; q<nlet; q++ ) { tot += cnt[q]; used[q] = 0; }
+	memset( iscom, 0, 0x80 );
+	while( nc < IGSX_NC )
+	{
+		k = -1;
+		for( q=0; q<nlet; q++ ) if( !used[q] && ( k < 0 || cnt[q] > cnt[k] ) ) k = q;
+		if( k < 0 || cnt[k] * 64 < tot ) break;
+		used[k] = 1; com[nc++] = let[k]; iscom[let[k]] = 1;
+	}
+	return( nc );
+}
+
+/* pass 2 over a row: gap mask, the masks of the common letters, and the rare letters' columns */
+static int igsx_row( unsigned char *s, int len, int nw8, uint64_t *gap, uint64_t *pl, unsigned char *com, int nc, igsx_rare *rare, int nrare, int maxrare, int row )
+{
+	int w, q, nw = ( len + 63 ) / 64;
+	const __m512i dash = _mm512_set1_epi8( '-' );
+	for( w=0; w<nw; w++ )
+	{
+		uint64_t lm = igsx_lenmask( len, w ), seen, rest;
+		__m512i x = _mm512_maskz_loadu_epi8( lm, (void *)( s + w * 64 ) );
+		seen = gap[w] = _mm512_cmpeq_epi8_mask( x, dash ) & lm;
+		for( q=0; q<nc; q++ ) { uint64_t m = _mm512_cmpeq_epi8_mask( x, _mm512_set1_epi8( (char)com[q] ) ) & lm; pl[q*nw8+w] = m; seen |= m; }
+		rest = ~seen & lm;
+		while( rest )
+		{
+			int b = __builtin_ctzll( rest );
+			if( nrare >= maxrare ) return( -1 );
+			rare[nrare].row = row; rare[nrare].col = w * 64 + b; rare[nrare].c = s[w*64+b]; nrare++;
+			rest &= rest - 1;
+		}
+	}
+	for( ; w<nw8; w++ ) { gap[w] = 0; for( q=0; q<nc; q++ ) pl[q*nw8+w] = 0; }
+	return( nrare );
+}
+
+static int igsx_runs( uint64_t *g, int nw, int len, igs_run *runs )
+{
+	int w, n = 0, inrun = 0, s = 0;
+	uint64_t prevtop = 0;
+	for( w=0; w<nw; w++ )
+	{
+		uint64_t x = g[w] ^ ( ( g[w] << 1 ) | prevtop );
+		prevtop = g[w] >> 63;
+		while( x )
+		{
+			int b = __builtin_ctzll( x ), pos = w * 64 + b;
+			if( ( g[w] >> b ) & 1 ) { s = pos; inrun = 1; }
+			else { runs[n].s = s; runs[n].e = pos - 1; n++; inrun = 0; }
+			x &= x - 1;
+		}
+	}
+	if( inrun ) { runs[n].s = s; runs[n].e = len - 1; n++; }
+	return( n );
+}
+
+static int igs_pairscores_x( char **seq1, char **seq2, int clus1, int clus2, int len, double *out, int *dzi )
+{
+	int nw = ( len + 63 ) / 64, nw8 = ( nw + 7 ) & ~7, nrow = clus1 + clus2;
+	int i, j, q1, q2, r, n1, n2, c, na1, na2, nc1, nc2, nr1, nr2, maxrare, d[IGSX_NC][IGSX_NC];
+	unsigned char let1[IGSX_MAXL], let2[IGSX_MAXL], com1[IGSX_NC], com2[IGSX_NC], iscom1[0x80], iscom2[0x80];
+	long cnt1[IGSX_MAXL], cnt2[IGSX_MAXL];
+	uint64_t *gap, *pl;
+	long long *cs;
+	igs_run *runbuf;
+	igsx_rare *rare1, *rare2;
+	int *nrun;
+	size_t rstride = (size_t)len / 2 + 2;
+
+	if( len < 1 ) return( 0 );
+	if( !igsx_count( seq1, clus1, len, let1, cnt1, &na1 ) || !igsx_count( seq2, clus2, len, let2, cnt2, &na2 ) ) return( 0 );
+	nc1 = igsx_common( let1, cnt1, na1, com1, iscom1 );
+	nc2 = igsx_common( let2, cnt2, na2, com2, iscom2 );
+	/* the rare letters cost a pass over the other group each; past that, the gather loop is cheaper */
+	maxrare = 16 + len / 8;
+	gap = malloc( sizeof( uint64_t ) * nw8 * nrow );
+	pl = malloc( sizeof( uint64_t ) * nw8 * IGSX_NC * nrow );
+	runbuf = malloc( sizeof( igs_run ) * rstride * nrow );
+	nrun = malloc( sizeof( int ) * nrow );
+	rare1 = malloc( sizeof( igsx_rare ) * ( maxrare + 1 ) );
+	rare2 = malloc( sizeof( igsx_rare ) * ( maxrare + 1 ) );
+	cs = malloc( sizeof( long long ) * clus1 * clus2 );
+	nr1 = nr2 = 0;
+	for( i=0; i<clus1 && nr1>=0; i++ )
+		nr1 = igsx_row( (unsigned char *)seq1[i], len, nw8, gap + (size_t)i * nw8, pl + (size_t)i * nw8 * IGSX_NC, com1, nc1, rare1, nr1, maxrare, i );
+	for( j=0; j<clus2 && nr1>=0 && nr2>=0; j++ )
+		nr2 = igsx_row( (unsigned char *)seq2[j], len, nw8, gap + (size_t)( clus1 + j ) * nw8, pl + (size_t)( clus1 + j ) * nw8 * IGSX_NC, com2, nc2, rare2, nr2, maxrare, j );
+	if( nr1 < 0 || nr2 < 0 )
+	{
+		free( gap ); free( pl ); free( runbuf ); free( nrun ); free( rare1 ); free( rare2 ); free( cs );
+		return( 0 );
+	}
+	for( q1=0; q1<nc1; q1++ ) for( q2=0; q2<nc2; q2++ ) d[q1][q2] = dzi[com1[q1]*0x80+com2[q2]];
+	for( r=0; r<nrow; r++ ) nrun[r] = igsx_runs( gap + (size_t)r * nw8, nw, len, runbuf + rstride * r );
+
+	/* column sums: common letter pairs by popcount, then the rare letters' columns */
+	for( i=0; i<clus1; i++ )
+	{
+		uint64_t *p1 = pl + (size_t)i * nw8 * IGSX_NC;
+		for( j=0; j<clus2; j++ )
+		{
+			uint64_t *p2 = pl + (size_t)( clus1 + j ) * nw8 * IGSX_NC;
+			__m512i acc = _mm512_setzero_si512();
+			int w;
+			for( q1=0; q1<nc1; q1++ ) for( q2=0; q2<nc2; q2++ )
+			{
+				__m512i n = _mm512_setzero_si512();
+				if( d[q1][q2] == 0 ) continue;
+				for( w=0; w<nw8; w+=8 )
+					n = _mm512_add_epi64( n, _mm512_popcnt_epi64( _mm512_and_si512( _mm512_loadu_si512( (void *)( p1 + q1 * nw8 + w ) ), _mm512_loadu_si512( (void *)( p2 + q2 * nw8 + w ) ) ) ) );
+				/* counts are below 2^31: a signed 32x32->64 multiply of the low halves is exact */
+				acc = _mm512_add_epi64( acc, _mm512_mul_epi32( n, _mm512_set1_epi64( d[q1][q2] ) ) );
+			}
+			cs[i*clus2+j] = _mm512_reduce_add_epi64( acc );
+		}
+	}
+	for( r=0; r<nr1; r++ )
+	{
+		int *row = dzi + rare1[r].c * 0x80, k = rare1[r].col;
+		long long *csi = cs + (size_t)rare1[r].row * clus2;
+		for( j=0; j<clus2; j++ ) csi[j] += row[(unsigned char)seq2[j][k]];
+	}
+	for( r=0; r<nr2; r++ )
+	{
+		int b = rare2[r].c, k = rare2[r].col;
+		long long *csj = cs + rare2[r].row;
+		for( i=0; i<clus1; i++ )
+		{
+			unsigned char a = (unsigned char)seq1[i][k];
+			if( iscom1[a] ) csj[(size_t)i*clus2] += dzi[a*0x80+b];
+		}
+	}
+
+	for( i=0; i<clus1; i++ )
+	{
+		uint64_t *g1 = gap + (size_t)i * nw8;
+		igs_run *run1 = runbuf + rstride * i;
+		unsigned char *m1 = (unsigned char *)seq1[i];
+		for( j=0; j<clus2; j++ )
+		{
+			uint64_t *g2 = gap + (size_t)( clus1 + j ) * nw8;
+			igs_run *run2 = runbuf + rstride * ( clus1 + j );
+			unsigned char *m2 = (unsigned char *)seq2[j];
+			double tmpscore = (double)cs[i*clus2+j], s;
+
+			n1 = nrun[i];
+			for( r=0; r<n1; r++ )
+			{
+				c = igsx_nxt( g2, nw, len, run1[r].s );
+				if( c <= run1[r].e )
+				{
+					s = amino_dis_consweight_multi['-'][m2[c]];
+					tmpscore += (double)penalty + s * (double)( 2 + run1[r].e - c );
+				}
+			}
+			n2 = nrun[clus1+j];
+			for( r=0; r<n2; r++ )
+			{
+				c = igsx_nxt( g1, nw, len, run2[r].s );
+				if( c <= run2[r].e )
+				{
+					s = amino_dis_consweight_multi[m1[c]]['-'];
+					tmpscore += (double)penalty + s * (double)( 2 + run2[r].e - c );
+				}
+			}
+			out[i*clus2+j] = tmpscore;
+		}
+	}
+	free( gap ); free( pl ); free( runbuf ); free( nrun ); free( rare1 ); free( rare2 ); free( cs );
+	return( 1 );
+}
+#endif
+
+#if defined(MAFFT_AVX512X)
+/* The column-major test "if( cpmx[l][j] )" of the match_calc set-ups, 8 columns at a time:
+   bit l of mask[j] is set when cpmx[l][j] != 0 (NaN included, -0.0 not, as in C). */
+void cpmx_colmask( double **cpmx, int nalph, int lgth, unsigned int *mask )
+{
+	int j = 0, l;
+	const __m512d zero = _mm512_setzero_pd();
+	for( ; j+8<=lgth; j+=8 )
+	{
+		__m256i acc = _mm256_setzero_si256();
+		for( l=0; l<nalph; l++ )
+			acc = _mm256_mask_or_epi32( acc, _mm512_cmp_pd_mask( _mm512_loadu_pd( cpmx[l] + j ), zero, _CMP_NEQ_UQ ), acc, _mm256_set1_epi32( (int)( 1u << l ) ) );
+		_mm256_storeu_si256( (__m256i *)( mask + j ), acc );
+	}
+	for( ; j<lgth; j++ )
+	{
+		unsigned int m = 0;
+		for( l=0; l<nalph; l++ ) if( cpmx[l][j] ) m |= 1u << l;
+		mask[j] = m;
+	}
+}
+#endif
+
 /* Per-pair tmpscore of intergroup_score() for every (i,j), into out[i*clus2+j].  With an
    integer-valued matrix each tmpscore is an exact integer, so how it is summed does not matter.
    Returns 0 (nothing written) when the matrix is not integral or a row is not plain 7-bit text. */
@@ -594,6 +867,9 @@ static int igs_pairscores( char **seq1, char **seq2, int clus1, int clus2, int l
 		}
 	}
 	if( !integral ) return( 0 );
+#if defined(MAFFT_AVX512X)
+	if( igs_pairscores_x( seq1, seq2, clus1, clus2, len, out, dzi ) ) return( 1 );
+#endif
 
 	nxtbuf = malloc( sizeof( int ) * stride * ( clus1 + clus2 ) );
 	runbuf = malloc( sizeof( igs_run ) * rstride * ( clus1 + clus2 ) );
@@ -16124,6 +16400,33 @@ static int makeresmap( char *seq, int *map )
 	for( col=0; seq[col]; col++ ) if( seq[col] != '-' ) map[n++] = col;
 	return( n );
 }
+#if defined(MAFFT_AVX512X)
+/* makeresmap() 64 columns at a time: the non-gap columns of each 16 are compressed out of a vector
+   of column numbers, in order.  map[] needs 16 spare entries (the stores are whole vectors). */
+static int makeresmap_avx512( char *seq, int *map )
+{
+	int n = 0, col = 0, len = strlen( seq ), q;
+	const __m512i dash = _mm512_set1_epi8( '-' ), step = _mm512_set1_epi32( 16 );
+	for( ; col+64<=len; col+=64 )
+	{
+		unsigned long long m = _mm512_cmpneq_epi8_mask( _mm512_loadu_si512( (void *)( seq + col ) ), dash );
+		__m512i c = _mm512_add_epi32( _mm512_set1_epi32( col ), _mm512_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 ) );
+		for( q=0; q<4; q++ )
+		{
+			__mmask16 k = (__mmask16)( m >> ( 16 * q ) );
+			_mm512_storeu_si512( (void *)( map + n ), _mm512_maskz_compress_epi32( k, c ) );
+			n += __builtin_popcount( (unsigned)k );
+			c = _mm512_add_epi32( c, step );
+		}
+	}
+	for( ; col<len; col++ ) if( seq[col] != '-' ) map[n++] = col;
+	return( n );
+}
+#define makeresmap( s, m ) makeresmap_avx512( s, m )
+#define RESMAP_SLACK 16
+#else
+#define RESMAP_SLACK 0
+#endif
 
 /* rowlo/rowhi == NULL: zero lgth1 x lgth2 first (original behaviour).
    Otherwise the caller guarantees impmtx is already zero and gets, per row, the range of columns written. */
@@ -16133,6 +16436,10 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 	double effij, effijx, effij_kozo, w, segimp;
 	int *pos1, *pos2, **map1, **map2, *nres1, *nres2;
 	LocalHom *tmpptr;
+#if defined(MAFFT_AVX512X)
+	double *fi_base;
+	size_t fi_stride;
+#endif
 
 	if( !rowlo )
 	{
@@ -16140,6 +16447,17 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 			impmtx[i][j] = 0.0;
 	}
 	effijx = 1.0 * fastathreshold;
+#if defined(MAFFT_AVX512X)
+	/* rows 0..lgth1-1 at a fixed stride from impmtx[0] (partSalignmm.c allocates it that way)? */
+	{
+		fi_base = impmtx[0]; fi_stride = 0;
+		if( rowlo && lgth1 >= 2 && impmtx[1] > impmtx[0] )
+		{
+			fi_stride = (size_t)( impmtx[1] - impmtx[0] );
+			for( i=2; i<lgth1 && fi_stride; i++ ) if( impmtx[i] != fi_base + (size_t)i * fi_stride ) fi_stride = 0;
+		}
+	}
+#endif
 
 	/* The original movereg() rescanned both gapped sequences from the start for every segment.
 	   Precompute residue->column maps once; the walk below visits the same (k1,k2) cells in the
@@ -16148,8 +16466,8 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 	map2 = malloc( clus2 * sizeof( int * ) );
 	nres1 = malloc( clus1 * sizeof( int ) );
 	nres2 = malloc( clus2 * sizeof( int ) );
-	for( i=0; i<clus1; i++ ) { map1[i] = malloc( ( lgth1 + 1 ) * sizeof( int ) ); nres1[i] = makeresmap( seq1[i], map1[i] ); }
-	for( j=0; j<clus2; j++ ) { map2[j] = malloc( ( lgth2 + 1 ) * sizeof( int ) ); nres2[j] = makeresmap( seq2[j], map2[j] ); }
+	for( i=0; i<clus1; i++ ) { map1[i] = malloc( ( lgth1 + 1 + RESMAP_SLACK ) * sizeof( int ) ); nres1[i] = makeresmap( seq1[i], map1[i] ); }
+	for( j=0; j<clus2; j++ ) { map2[j] = malloc( ( lgth2 + 1 + RESMAP_SLACK ) * sizeof( int ) ); nres2[j] = makeresmap( seq2[j], map2[j] ); }
 
 	for( i=0; i<clus1; i++ )
 	{
@@ -16197,6 +16515,22 @@ void fillimp_track( double **impmtx, double *imp, int clus1, int clus2, int lgth
 				}
 
 				nlim = MIN( e1 - s1, e2 - s2 );
+#if defined(MAFFT_AVX512X)
+				if( rowlo && fi_stride )
+				{
+					/* the loop below, addressing the cell from one base pointer */
+					int *q1 = pos1 + s1, *q2 = pos2 + s2;
+					for( n=0; n<=nlim; n++ )
+					{
+						int k1 = q1[n], k2 = q2[n];
+						double *cell = fi_base + (size_t)k1 * fi_stride + k2;
+						*cell = MULADD( segimp, w, *cell );
+						if( k2 < rowlo[k1] ) rowlo[k1] = k2;
+						if( k2 > rowhi[k1] ) rowhi[k1] = k2;
+					}
+				}
+				else
+#endif
 				if( rowlo )
 				{
 					for( n=0; n<=nlim; n++ )

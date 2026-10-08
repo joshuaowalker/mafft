@@ -499,6 +499,370 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 	*endaljpt = endalj;
 	return( 1 );
 }
+#if defined(MAFFT_AVX512X)
+/*
+ * Lfill_kb: the marker fill above in a striped layout (Farrar's), with ijp kept as one byte per
+ * cell (0 diagonal, KB_H for LMARK_H, KB_V for LMARK_V, KB_STOP for lstop) instead of an int.
+ *
+ * Column c = j-1 of a row (c = 0 .. lgth2-1, padded to 16*S) lives in lane c / S, position c % S,
+ * S = ceil( lgth2 / 16 ).  Cell j reads prev[j-1] (its own position in the previous row) and the
+ * horizontal state H_j = (j-1)*ext + max_{k <= max(j-2,0)} T_k, T_k = prev[k] - k*ext.  In this
+ * layout that maximum is the larger of a running maximum along the cell's own lane (positions
+ * before it) and a carry: the maxima of the whole lanes below it (for lane 0, T_0 itself, which is
+ * the k = 0 term cell 1 uses).  The lane maxima come from the previous row's pass, so a row is one
+ * pass of plain vertical max/add operations with no prefix scan inside the loop.  Padding columns
+ * (c >= lgth2) sit above every real column, and the scan only carries to higher columns, so they
+ * never reach a real cell; they are kept out of the row maximum by a mask.
+ *
+ * The rest is Lfill_int's arithmetic per cell, unchanged.  Every row is kept (striped, row i's
+ * value for column c, i.e. prev[c] as row i+1 reads it, at KB_RV( i, c )) for the marker replay,
+ * which kb_hk() and kb_vmp() do exactly as lres_hk() and lres_vmp() do over Lfill_int's rows.
+ * The first cell holding a row's maximum is the first position holding it in the lowest lane
+ * that has it (lanes are in column order).  Ltracking_kb() is Ltracking() reading kb_ijv().
+ */
+/* 64-byte aligned allocation, released with aligned_free_64() */
+static void *aligned_alloc_64( size_t n )
+{
+	char *raw = malloc( n + 64 + sizeof( void * ) ), *p;
+	if( raw == NULL ) ErrorExit( "Cannot allocate memory." );
+	p = (char *)( ( (uintptr_t)( raw + sizeof( void * ) ) + 63 ) & ~(uintptr_t)63 );
+	( (void **)p )[-1] = raw;
+	return( p );
+}
+static void aligned_free_64( void *p ) { if( p ) free( ( (void **)p )[-1] ); }
+#define KB_H 1
+#define KB_V 2
+#define KB_STOP 3
+static TLS unsigned char *kb_raw = NULL;
+static TLS int *kb_rows = NULL;
+static TLS size_t kb_cap = 0, kb_rcap = 0;
+static TLS int kb_S, kb_ext, kb_v0;
+#define KB_RSTRIDE ( (size_t)( kb_S + 1 ) * 16 )
+/* row r's value at column c (striped vector c % S, lane c / S; vector 0 holds the shifted values) */
+#define KB_RV( r, c ) ( kb_rows[(size_t)( r ) * KB_RSTRIDE + (size_t)( ( c ) % kb_S ) * 16 + ( c ) / kb_S] )
+#define KB_KIND( i, c ) ( kb_raw[(size_t)( i ) * kb_S * 16 + (size_t)( ( c ) % kb_S ) * 16 + ( c ) / kb_S] )
+
+static int Lfill_kb( double **amino_dynamicmtx, double **n_dynamicmtx, double scoreoffset,
+                     char *s1, char *s2, int lgth1, int lgth2,
+                     double *maxwmpt, int *endalipt, int *endaljpt )
+{
+	int i, j, c, k, l, s, S, maxabs = 0;
+	int pen = penalty, ext = penalty_ex;
+	double thr = -offset + scoreoffset * 600;
+	int ithr, *prof[0x100], *profbuf, nprof = 0, *vmraw, *vm, *wmrow;
+	int maxwm, endali = 0, endalj = 0, rowmax;
+	unsigned char *u1 = (unsigned char *)s1, *u2 = (unsigned char *)s2;
+	unsigned char used[0x100];
+	size_t need, needkb, rs;
+	__m512i lanebase, ltn;
+
+	if( lgth1 < 1 || lgth2 < 1 ) return( 0 );
+	if( thr != (double)(int)thr ) return( 0 );
+	ithr = (int)thr;
+	for( i=0; i<nalphabets; i++ ) for( j=0; j<nalphabets; j++ )
+	{
+		double v = n_dynamicmtx[i][j];
+		if( v != (double)(int)v ) return( 0 );
+		if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
+	}
+	memset( used, 0, sizeof( used ) );
+	for( i=0; i<lgth1; i++ ) used[u1[i]] = 1;
+	for( j=0; j<lgth2; j++ ) used[u2[j]] = 1;
+	for( c=0; c<0x100; c++ ) if( used[c] )
+	{
+		for( k=0; k<0x100; k++ ) if( used[k] )
+		{
+			double v = amino_dynamicmtx[c][k];
+			if( v != (double)(int)v || fabs( v ) > 1e6 ) return( 0 );
+			if( abs( (int)v ) > maxabs ) maxabs = abs( (int)v );
+		}
+	}
+	{
+		double bound = (double)( maxabs + abs( pen ) + abs( ext ) + abs( ithr ) + 1 ) * ( lgth1 + lgth2 + 4 ) * 2.0;
+		if( bound > 5.0e8 ) return( 0 );
+	}
+
+	S = kb_S = ( lgth2 + 15 ) / 16;
+	rs = KB_RSTRIDE;
+	need = (size_t)( lgth1 + 1 ) * rs;
+	needkb = (size_t)( lgth1 + 1 ) * S * 16;
+	if( need > ( (size_t)1 << 26 ) ) return( 0 );
+	if( need > kb_rcap )
+	{
+		aligned_free_64( kb_rows );
+		kb_rows = aligned_alloc_64( sizeof( int ) * need );
+		kb_rcap = need;
+	}
+	if( needkb > kb_cap )
+	{
+		free( kb_raw );
+		kb_raw = malloc( needkb );
+		if( kb_raw == NULL ) ErrorExit( "Cannot allocate the local alignment traceback." );
+		kb_cap = needkb;
+	}
+#ifdef MAFFT_POISON_TEST
+	memset( kb_rows, 0xa5, sizeof( int ) * need ); memset( kb_raw, 0xa5, needkb );
+#endif
+
+	/* striped profiles: cell j = c+1 adds prof[.][j] (prof[.][lgth2] = 0; padding 0) */
+	for( c=0; c<0x100; c++ ) prof[c] = NULL;
+	for( c=0; c<0x100; c++ ) if( used[c] ) nprof++;
+	profbuf = aligned_alloc_64( sizeof( int ) * nprof * S * 16 );
+	k = 0;
+	for( c=0; c<0x100; c++ ) if( used[c] )
+	{
+		double *row = amino_dynamicmtx[c];
+		prof[c] = profbuf + (size_t)k * S * 16;
+		for( s=0; s<S; s++ ) for( l=0; l<16; l++ )
+		{
+			int jj = l * S + s + 1;
+			prof[c][s*16+l] = ( jj < lgth2 ) ? (int)row[u2[jj]] : 0;
+		}
+		k++;
+	}
+	vmraw = aligned_alloc_64( sizeof( int ) * S * 16 * 2 );
+	vm = vmraw; wmrow = vmraw + S * 16;
+
+	/* row 0: R_0[c] = mtx[s1[0]][s2[c]] for c < lgth2 (0 in the padding), in the shifted layout
+	   (vector s holds columns l*S+s); vm[j] = R_0[j-1] */
+	{
+		int *r0 = kb_rows;
+		for( s=0; s<S; s++ ) for( l=0; l<16; l++ )
+		{
+			int cc = l * S + s;
+			r0[s*16+l] = ( cc < lgth2 ) ? (int)amino_dynamicmtx[u1[0]][u2[cc]] : 0;
+		}
+		memcpy( vm, r0, sizeof( int ) * S * 16 );
+		kb_v0 = r0[0]; /* m[1] before row 1 overwrites R_0[0] */
+	}
+	kb_ext = ext;
+
+	lanebase = _mm512_mullo_epi32( _mm512_setr_epi32( 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 ), _mm512_set1_epi32( S ) );
+	/* lane maxima of row 0's T (padding included: it only reaches padding) */
+	{
+		__m512i cext = _mm512_mullo_epi32( lanebase, _mm512_set1_epi32( ext ) );
+		ltn = _mm512_set1_epi32( INT_MIN );
+		for( s=0; s<S; s++ )
+		{
+			if( s > 0 ) ltn = _mm512_max_epi32( ltn, _mm512_sub_epi32( _mm512_load_si512( (void *)( kb_rows + s*16 ) ), cext ) );
+			cext = _mm512_add_epi32( cext, _mm512_set1_epi32( ext ) );
+		}
+	}
+
+	maxwm = INT_MIN;
+	for( i=1; i<=lgth1; i++ )
+	{
+		int *prev = kb_rows + (size_t)( i-1 ) * rs, *cur = kb_rows + (size_t)i * rs;
+		int *profrow = ( i < lgth1 ) ? prof[u1[i]] : prof[u1[0]]; /* last row: cur[] is never read again */
+		unsigned char *kbrow = kb_raw + (size_t)i * S * 16;
+		int special = (int)amino_dynamicmtx[u2[0]][u1[i-1]]; /* prev[0] = initverticalw[i-1] */
+		const __m512i vpen = _mm512_set1_epi32( pen ), vext = _mm512_set1_epi32( ext ), vthr = _mm512_set1_epi32( ithr );
+		const __m512i vkh = _mm512_set1_epi32( KB_H ), vkv = _mm512_set1_epi32( KB_V ), vks = _mm512_set1_epi32( KB_STOP );
+		const __m512i ninf = _mm512_set1_epi32( INT_MIN ), one = _mm512_set1_epi32( 1 ), vn = _mm512_set1_epi32( lgth2 );
+		__m512i r0, t0, lt, carry, e, cext, cextpen, vmax, pos;
+		/* vector 0 of the previous row: its columns l*S, i.e. the previous lane's last cell, and
+		   prev[0] in lane 0 */
+		if( i == 1 ) r0 = _mm512_mask_mov_epi32( _mm512_load_si512( (void *)prev ), 1, _mm512_set1_epi32( special ) );
+		else r0 = _mm512_alignr_epi32( _mm512_load_si512( (void *)( prev + (size_t)S * 16 ) ), _mm512_set1_epi32( special ), 15 );
+		_mm512_store_si512( (void *)prev, r0 );
+		/* lane maxima of T over the previous row, then the carry: the maximum over the lanes below,
+		   and T_0 for lane 0 */
+		cext = _mm512_mullo_epi32( lanebase, vext );
+		t0 = _mm512_sub_epi32( r0, cext );
+		lt = _mm512_max_epi32( ltn, t0 );
+		carry = _mm512_alignr_epi32( lt, ninf, 15 );
+		carry = _mm512_max_epi32( carry, _mm512_alignr_epi32( carry, ninf, 15 ) );
+		carry = _mm512_max_epi32( carry, _mm512_alignr_epi32( carry, ninf, 14 ) );
+		carry = _mm512_max_epi32( carry, _mm512_alignr_epi32( carry, ninf, 12 ) );
+		carry = _mm512_max_epi32( carry, _mm512_alignr_epi32( carry, ninf, 8 ) );
+		carry = _mm512_mask_mov_epi32( carry, 1, _mm512_set1_epi32( special ) ); /* T_0 = prev[0] */
+
+		e = ninf;
+		cextpen = _mm512_add_epi32( cext, vpen );
+		vmax = ninf;
+		pos = lanebase;
+		ltn = ninf;
+		for( s=0; s<S; s++ )
+		{
+			__m512i a = _mm512_load_si512( (void *)( prev + s*16 ) ), vmj = _mm512_load_si512( (void *)( vm + s*16 ) );
+			__m512i t = _mm512_sub_epi32( a, cext ), m, g, wm, ij, v;
+			__mmask16 ch, cvt, clamp;
+			m = _mm512_max_epi32( e, carry );
+			e = _mm512_max_epi32( e, t );
+			g = _mm512_add_epi32( m, cextpen );    /* H + pen */
+			ch = _mm512_cmpgt_epi32_mask( g, a );
+			wm = _mm512_max_epi32( a, g );
+			g = _mm512_add_epi32( vmj, vpen );
+			cvt = _mm512_cmpgt_epi32_mask( g, wm );
+			wm = _mm512_max_epi32( wm, g );
+			_mm512_store_si512( (void *)( vm + s*16 ), _mm512_add_epi32( _mm512_max_epi32( a, vmj ), vext ) );
+			_mm512_store_si512( (void *)( wmrow + s*16 ), wm );
+			vmax = _mm512_mask_max_epi32( vmax, _mm512_cmplt_epi32_mask( pos, vn ), vmax, wm ); /* real columns only */
+			clamp = _mm512_cmpgt_epi32_mask( vthr, wm );
+			ij = _mm512_maskz_mov_epi32( ch, vkh );
+			ij = _mm512_mask_mov_epi32( ij, cvt, vkv );
+			ij = _mm512_mask_mov_epi32( ij, clamp, vks );
+			_mm_store_si128( (__m128i *)( kbrow + s*16 ), _mm512_cvtepi32_epi8( ij ) );
+			wm = _mm512_max_epi32( wm, vthr );
+			v = _mm512_add_epi32( wm, _mm512_load_si512( (void *)( profrow + s*16 ) ) );
+			_mm512_store_si512( (void *)( cur + (size_t)( s+1 ) * 16 ), v );
+			cext = _mm512_add_epi32( cext, vext );
+			cextpen = _mm512_add_epi32( cextpen, vext );
+			/* next row's T at column c+1, same lane except the last position (lane above, added
+			   with vector 0 at the next row's start) */
+			if( s < S-1 ) ltn = _mm512_max_epi32( ltn, _mm512_sub_epi32( v, cext ) );
+			pos = _mm512_add_epi32( pos, one );
+		}
+		rowmax = _mm512_reduce_max_epi32( vmax );
+		if( rowmax > maxwm )
+		{
+			/* the first column holding it: the lowest lane that has it (lanes are in column order),
+			   then its first position there */
+			__m512i vr = _mm512_set1_epi32( rowmax );
+			unsigned any = 0;
+			int ln, c0;
+			pos = lanebase;
+			for( s=0; s<S; s++ )
+			{
+				any |= _mm512_mask_cmpeq_epi32_mask( _mm512_cmplt_epi32_mask( pos, vn ), _mm512_load_si512( (void *)( wmrow + s*16 ) ), vr );
+				pos = _mm512_add_epi32( pos, one );
+			}
+			ln = __builtin_ctz( any );
+			for( s=0; wmrow[s*16+ln] != rowmax; s++ )
+				;
+			c0 = ln * S + s;
+			maxwm = rowmax; endali = i; endalj = c0 + 1;
+		}
+	}
+
+	aligned_free_64( profbuf ); aligned_free_64( vmraw );
+	*maxwmpt = (double)maxwm;
+	*endalipt = endali;
+	*endaljpt = endalj;
+	return( 1 );
+}
+
+/* lres_hk() and lres_vmp() over the striped rows */
+static int kb_hk( int i, int j )
+{
+	int jj, tbest = KB_RV( i-1, 0 ), tbestk = 0;
+	for( jj=2; jj<=j; jj++ )
+	{
+		int q = KB_RV( i-1, jj-2 ) - ( jj-2 ) * kb_ext;
+		if( q > tbest ) { tbest = q; tbestk = jj-2; }
+	}
+	return( tbestk );
+}
+static int kb_vmp( int i, int j )
+{
+	int r, vm = ( j == 1 ) ? kb_v0 : KB_RV( 0, j-1 ), vmp = 0;
+	for( r=1; r<i; r++ )
+	{
+		int p = KB_RV( r-1, j-1 );
+		if( p > vm ) { vm = p; vmp = r-1; }
+		vm += kb_ext;
+	}
+	return( vmp );
+}
+
+/* ijp[i][j] as Ltracking resolves it after Lfill_int (row 0 and column 0 hold localstop) */
+static int kb_ijv( int i, int j, int lstop )
+{
+	if( i <= 0 || j <= 0 ) return( lstop );
+	switch( KB_KIND( i, j-1 ) )
+	{
+		case KB_H: return( -( j - kb_hk( i, j ) ) );
+		case KB_V: return( i - kb_vmp( i, j ) );
+		case KB_STOP: return( lstop );
+		default: return( 0 );
+	}
+}
+#define KB_ISSTOP( i, j ) ( ( i ) <= 0 || ( j ) <= 0 || KB_KIND( i, ( j )-1 ) == KB_STOP )
+
+static void Ltracking_kb( char **seq1, char **seq2, char **mseq1, char **mseq2,
+                            int *off1pt, int *off2pt, int endi, int endj, int lstop,
+                            int *warpis, int *warpjs, int warpbase )
+{
+	int l, iin, jin, lgth1, lgth2, k, limk;
+	int ifi=0, jfi=0;
+	char *gap = newgapstr;
+	lgth1 = strlen( seq1[0] );
+	lgth2 = strlen( seq2[0] );
+
+	mseq1[0] += lgth1+lgth2;
+	*mseq1[0] = 0;
+	mseq2[0] += lgth1+lgth2;
+	*mseq2[0] = 0;
+	iin = endi; jin = endj;
+	limk = lgth1+lgth2;
+	for( k=0; k<=limk; k++ )
+	{
+		int ijv = kb_ijv( iin, jin, lstop );
+		if( ijv >= warpbase )
+		{
+			ifi = warpis[ijv-warpbase];
+			jfi = warpjs[ijv-warpbase];
+		}
+		else if( ijv < 0 )
+		{
+			ifi = iin-1; jfi = jin+ijv;
+		}
+		else if( ijv > 0 )
+		{
+			ifi = iin-ijv; jfi = jin-1;
+		}
+		else
+		{
+			ifi = iin-1; jfi = jin-1;
+		}
+
+		if( ifi == -warpbase && jfi == -warpbase )
+		{
+			l = iin;
+			while( --l >= 0 )
+			{
+				*--mseq1[0] = seq1[0][l];
+				*--mseq2[0] = *gap;
+				k++;
+			}
+			l= jin;
+			while( --l >= 0 )
+			{
+				*--mseq1[0] = *gap;
+				*--mseq2[0] = seq2[0][l];
+				k++;
+			}
+			break;
+		}
+		else
+		{
+			l = iin - ifi;
+			while( --l > 0 )
+			{
+				*--mseq1[0] = seq1[0][ifi+l];
+				*--mseq2[0] = *gap;
+				k++;
+			}
+			l= jin - jfi;
+			while( --l > 0 )
+			{
+				*--mseq1[0] = *gap;
+				*--mseq2[0] = seq2[0][jfi+l];
+				k++;
+			}
+		}
+
+		if( iin <= 0 || jin <= 0 ) break;
+		*--mseq1[0] = seq1[0][ifi];
+		*--mseq2[0] = seq2[0][jfi];
+		if( KB_ISSTOP( ifi, jfi ) ) break;
+		k++;
+		iin = ifi; jin = jfi;
+	}
+	if( ifi == -1 ) *off1pt = 0; else *off1pt = ifi;
+	if( jfi == -1 ) *off2pt = 0; else *off2pt = jfi;
+}
+#endif
 #else
 static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double scoreoffset,
                       char *s1, char *s2, int lgth1, int lgth2, int **ijp, int lstop,
@@ -998,6 +1362,9 @@ double L__align11( double **n_dynamicmtx, double scoreoffset, char **seq1, char 
 	double *prevwmrecords = NULL;
 	int warpn = 0;
 	int warpbase;
+#if defined(MAFFT_AVX512X)
+	int kbfill = 0;
+#endif
 	double curm = 0.0;
 	double *wmrecordspt, *wmrecords1pt, *prevwmrecordspt;
 	int *warpipt, *warpjpt;
@@ -1150,6 +1517,17 @@ double L__align11( double **n_dynamicmtx, double scoreoffset, char **seq1, char 
 	}
 	ijp = commonIP;
 
+#if defined(MAFFT_AVX512X)
+	if( !trywarp )
+	{
+		localstop = lgth1+lgth2+1;
+		if( Lfill_kb( amino_dynamicmtx, n_dynamicmtx, scoreoffset, seq1[0], seq2[0], lgth1, lgth2, &maxwm, &endali, &endalj ) )
+		{
+			kbfill = 1;
+			goto Lint_done;
+		}
+	}
+#endif
 	if( !trywarp )
 	{
 		localstop = lgth1+lgth2+1;
@@ -1453,7 +1831,11 @@ fprintf( stderr, "\n" );
 #endif
 
 Lint_done:
+#if defined(MAFFT_AVX512X)
+	if( kbfill ? KB_ISSTOP( endali, endalj ) : ( ijp[endali][endalj] == localstop ) )
+#else
 	if( ijp[endali][endalj] == localstop )
+#endif
 	{
 		strcpy( seq1[0], "" );
 		strcpy( seq2[0], "" );
@@ -1462,6 +1844,11 @@ Lint_done:
 		return( 0.0 );
 	}
 		
+#if defined(MAFFT_AVX512X)
+	if( kbfill )
+		Ltracking_kb( seq1, seq2, mseq1, mseq2, off1pt, off2pt, endali, endalj, localstop, warpis, warpjs, warpbase );
+	else
+#endif
 	Ltracking( currentw, lastverticalw, seq1, seq2, mseq1, mseq2, ijp, off1pt, off2pt, endali, endalj, warpis, warpjs, warpbase );
 	if( warpis ) free( warpis );
 	if( warpjs ) free( warpjs );

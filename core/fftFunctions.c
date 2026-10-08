@@ -304,6 +304,54 @@ int alignableReagion( int    clus1, int    clus2,
 			}
 			cp1 = cprf; cp2 = cprf + (size_t)len * nu;
 			memset( cprf, 0, sizeof( double ) * (size_t)len * nu * 2 );
+#if defined(MAFFT_AVX512X)
+			/* Bin-major profiles (cp[ci*len+i]): for each character of a 64-column block, the columns
+			   holding it get e added in its bin, 8 at a time under a mask.  Each bin of each column
+			   still receives its additions in row order, and the site score reads the same values. */
+			for( j=0; j<clus1+clus2; j++ )
+			{
+				unsigned char *s = (unsigned char *)( j < clus1 ? seq1[j] : seq2[j-clus1] );
+				double *cp = ( j < clus1 ) ? cp1 : cp2;
+				__m512d ve = _mm512_set1_pd( ( j < clus1 ) ? eff1[j] : eff2[j-clus1] );
+				for( i=0; i<len; i+=64 )
+				{
+					unsigned long long lm = ( len - i >= 64 ) ? ~0ULL : ( ( 1ULL << ( len - i ) ) - 1 ), rest = lm;
+					__m512i x = _mm512_maskz_loadu_epi8( lm, (void *)( s + i ) );
+					while( rest )
+					{
+						unsigned char c = s[i+__builtin_ctzll( rest )];
+						unsigned long long m = _mm512_cmpeq_epi8_mask( x, _mm512_set1_epi8( (char)c ) ) & rest;
+						int ci = cidx[c], q;
+						rest &= ~m;
+						if( ci < 0 ) continue;
+						for( q=0; q<8; q++ )
+						{
+							__mmask8 m8 = (__mmask8)( m >> ( 8 * q ) );
+							double *pt = cp + (size_t)ci * len + i + 8 * q;
+							_mm512_mask_storeu_pd( pt, m8, _mm512_add_pd( _mm512_maskz_loadu_pd( m8, pt ), ve ) );
+						}
+					}
+				}
+			}
+			for( i=0; i<len; i++ )
+			{
+				int a, b;
+				stra[i] = 0.0;
+				for( a=0; a<nu; a++ )
+				{
+					double p1 = cp1[(size_t)a*len+i];
+					if( !p1 ) continue;
+					for( b=0; b<nu; b++ )
+					{
+						double p2 = cp2[(size_t)b*len+i];
+						if( !p2 ) continue;
+						stra[i] += n_disFFT[ub[a]][ub[b]] * p1 * p2;
+					}
+				}
+				stra[i] /= totaleff;
+			}
+			goto profiles_done;
+#else
 #if defined(__AVX512BW__)
 			/* the same adds in the same order, visiting only the non-gap bytes (when '-' has no bin) */
 			for( j=0; j<clus1+clus2 && cidx['-'] < 0; j++ )
@@ -348,6 +396,7 @@ int alignableReagion( int    clus1, int    clus2,
 				stra[i] /= totaleff;
 			}
 			goto profiles_done;
+#endif
 		}
 	}
 	for( i=0; i<len; i++ )

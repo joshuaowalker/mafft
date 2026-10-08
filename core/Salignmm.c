@@ -322,6 +322,28 @@ static void match_calc( double **n_dynamicmtx, double *match, double **cpmx1, do
 	if( initialize )
 	{
 		int count = 0;
+#if defined(MAFFT_AVX512X)
+		/* the nonzero letters of each column in ascending l, as the loop below finds them */
+		if( nalphabets <= 32 )
+		{
+			unsigned int *cm = malloc( sizeof( unsigned int ) * ( lgth2 + 1 ) ), m;
+			cpmx_colmask( cpmx2, nalphabets, lgth2, cm );
+			for( j=0; j<lgth2; j++ )
+			{
+				count = 0;
+				for( m=cm[j]; m; m&=m-1 )
+				{
+					l = __builtin_ctz( m );
+					cpmxpd[j][count] = cpmx2[l][j];
+					cpmxpdn[j][count] = l;
+					count++;
+				}
+				cpmxpdn[j][count] = -1;
+			}
+			free( cm );
+		}
+		else
+#endif
 		for( j=0; j<lgth2; j++ )
 		{
 			count = 0;
