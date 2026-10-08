@@ -36,7 +36,7 @@
 
 
 
-#define VERSION "7.526-opt6"
+#define VERSION "7.526-opt7"
 #define SHOWVERSION reporterr( "%s (%s) Version " VERSION "\nalg=%c, model=%s, amax=%3.1f\n%d thread(s)\n\n", progName( argv[0] ), (dorp=='d')?"nuc":((nblosum==-2)?"text":"aa"), alg, modelname, specificityconsideration, nthread )
 
 /* a*b+c rounded the way the stock build rounds it, for rewritten code that must stay
