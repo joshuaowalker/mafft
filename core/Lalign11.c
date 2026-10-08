@@ -4,6 +4,12 @@
 #include <stdint.h>
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
+#if defined(__ARM_FEATURE_SVE) && !defined(__APPLE__)
+#include <arm_sve.h>
+#ifndef LSVE_MINLANES
+#define LSVE_MINLANES 8 /* the SVE fill is used for vectors of at least this many int32 lanes */
+#endif
+#endif
 #elif defined(__AVX512F__) || defined(__SSE4_1__)
 #include <immintrin.h>
 #endif
@@ -99,12 +105,13 @@ static void match_calc_bk( double *match, double **cpmx1, double **cpmx2, int i1
 }
 #endif
 
-#if defined(__AVX2__) && !defined(__ARM_NEON)
+#if ( defined(__AVX2__) && !defined(__ARM_NEON) ) || ( defined(__ARM_NEON) && !defined(__APPLE__) )
 /*
  * Used by every AVX2 build, AVX-512 builds included: on Zen 4 (c7a) this fill made L-INS-i
  * about 7% faster than the AVX-512 prefix-scan fill further down, which AVX-512 builds used
  * before.  The integer DP is the same under every rounding class, so MAFFT_STOCK_FMA does not
- * matter here.
+ * matter here.  arm64 builds other than Apple's (Linux on Graviton) use it too, with a NEON
+ * loop; the Apple build keeps the prefix-scan fill (its all-pairs stage runs on the GPU).
  *
  * The AVX2 integer fill (Lfill_int below) does not compute the traceback offsets themselves.  A
  * cell whose best move is a horizontal gap stores LMARK_H, a vertical gap LMARK_V, and every DP
@@ -287,8 +294,15 @@ static double Ltracking( double *lasthorizontalw, double *lastverticalw,
  * Lfill_int for AVX2 (see LFILL_MARKS above): the same integer fill, 8 cells at a time, storing
  * LMARK_H / LMARK_V instead of gap offsets, so neither the first-index scan for the horizontal
  * state nor the vmp[] rows are needed.  Values, wm, the threshold clamp, ijp's 0 / lstop cells,
- * maxwm and the end point are computed exactly as in the original.
+ * maxwm and the end point are computed exactly as in the original.  On Linux arm64 the same
+ * loop runs 4 cells at a time with NEON, or svcntw() at a time with SVE when the vectors are at
+ * least 256 bits wide (Graviton3); 128-bit SVE (Graviton4) uses the NEON loop.
  */
+#if defined(__ARM_NEON)
+#define LPROF_STRIDE ( ( lgth2 + 4 + 3 ) & ~3 ) /* each profile row 16-byte aligned */
+#else
+#define LPROF_STRIDE ( lgth2 + 4 )
+#endif
 static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double scoreoffset,
                       char *s1, char *s2, int lgth1, int lgth2, int **ijp, int lstop,
                       double *maxwmpt, int *endalipt, int *endaljpt )
@@ -298,6 +312,13 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 	double thr = -offset + scoreoffset * 600;
 	int ithr, *prof[0x100], *profbuf, nprof = 0;
 	int *prev, *cur, *vm, *hq, *wmrow, *vmraw;
+#if defined(__ARM_NEON)
+	int *kx, *kp;
+#endif
+#if defined(__ARM_FEATURE_SVE)
+	/* lsve_nstep: 0 (use NEON), else the log2 of the lanes per SVE vector (2..4 handled) */
+	int vl = (int)svcntw(), lsve_nstep = ( vl >= LSVE_MINLANES && vl <= 16 ) ? ( vl >= 16 ? 4 : vl >= 8 ? 3 : 2 ) : 0;
+#endif
 	int tbest, jj;
 	int maxwm, endali = 0, endalj = 0, rowmax;
 	unsigned char *u1 = (unsigned char *)s1, *u2 = (unsigned char *)s2;
@@ -334,12 +355,12 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 
 	for( c=0; c<0x100; c++ ) prof[c] = NULL;
 	for( c=0; c<0x100; c++ ) if( used[c] ) nprof++;
-	profbuf = malloc( sizeof( int ) * nprof * ( lgth2 + 4 ) );
+	profbuf = malloc( sizeof( int ) * nprof * LPROF_STRIDE );
 	k = 0;
 	for( c=0; c<0x100; c++ ) if( used[c] )
 	{
 		double *row = amino_dynamicmtx[c];
-		prof[c] = profbuf + k * ( lgth2 + 4 );
+		prof[c] = profbuf + k * LPROF_STRIDE;
 		for( j=0; j<lgth2; j++ ) prof[c][j] = (int)row[u2[j]];
 		prof[c][lgth2] = 0;
 		k++;
@@ -362,10 +383,23 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 #ifdef MAFFT_POISON_TEST
 	memset( lr_raw, 0xa5, sizeof( int ) * need );
 #endif
+#if defined(__ARM_NEON)
+	/* the NEON loop starts at cell 4 (ijp rows come from malloc, 16-byte aligned): row cell 4 aligned too */
+	lr_base = (int *)( ( (uintptr_t)( lr_raw + 8 ) & ~(uintptr_t)31 ) );
+#else
 	lr_base = (int *)( ( (uintptr_t)( lr_raw + 8 ) & ~(uintptr_t)31 ) ) + 7; /* lr_base + 1 is 32-byte aligned */
+#endif
 	lr_ext = ext;
 	vmraw = malloc( sizeof( int ) * ( lgth2 + 16 ) );
+#if defined(__ARM_NEON)
+	vm    = (int *)( ( (uintptr_t)( vmraw + 8 ) & ~(uintptr_t)31 ) );
+	/* kx[k] = k*ext, kp[k] = k*ext + ext + pen (horizontal gap scan offsets, read by the NEON loop) */
+	kx = malloc( sizeof( int ) * 2 * ( lgth2 + 8 ) );
+	kp = kx + lgth2 + 8;
+	for( k=0; k<lgth2+8; k++ ) { kx[k] = k * ext; kp[k] = k * ext + ext + pen; }
+#else
 	vm    = (int *)( ( (uintptr_t)( vmraw + 8 ) & ~(uintptr_t)31 ) ) + 7;
+#endif
 	hq    = malloc( sizeof( int ) * ( lgth2 + 4 ) );
 	wmrow = malloc( sizeof( int ) * ( lgth2 + 4 ) );
 #ifdef MAFFT_POISON_TEST
@@ -394,6 +428,146 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		rowmax = INT_MIN;
 		if( !profrow ) profrow = prof[u1[0]]; /* last row: cur[] is never read again */
 		j = 1;
+#if defined(__ARM_NEON)
+		if( lgth2 >= 7 )
+		{
+			/* Cells 1..3 in scalar code (the same rules as the remaining cells below), so that the
+			   vector loop's stores into ijp, cur, vm and wmrow are 16-byte aligned. */
+			for( ; j<4; j++ )
+			{
+				int p = prev[j-1], wm = p, ij = 0, g;
+				if( j >= 2 )
+				{
+					int q = prev[j-2] - ( j-2 ) * ext;
+					if( q > tbest ) tbest = q;
+				}
+				g = tbest + ( j-1 ) * ext + pen;
+				if( g > wm ) { wm = g; ij = LMARK_H; }
+				g = vm[j] + pen;
+				if( g > wm ) { wm = g; ij = LMARK_V; }
+				if( p > vm[j] ) vm[j] = p;
+				vm[j] += ext;
+				wmrow[j] = wm;
+				rowmax = ( wm > rowmax ) ? wm : rowmax;
+				if( wm < ithr ) { ij = lstop; wm = ithr; }
+				ijrow[j] = ij;
+				cur[j] = wm + profrow[j];
+			}
+		}
+#if defined(__ARM_FEATURE_SVE)
+		if( j == 4 && lsve_nstep )
+		{
+			/* SVE, vector-length agnostic: svcntw() cells at a time (chosen only for vectors of at
+			   least LSVE_MINLANES lanes; 128-bit SVE has the NEON loop's width and more work per
+			   step).  The same operations as the NEON loop: the in-block prefix max shifts lanes up
+			   with tbl (an out-of-range index reads 0) and a max predicated on the lanes that
+			   received a value. */
+			const svbool_t pt = svptrue_b32();
+			const svint32_t vpen = svdup_n_s32( pen ), vext = svdup_n_s32( ext ), vthr = svdup_n_s32( ithr );
+			const svint32_t vstop = svdup_n_s32( lstop ), vmarkh = svdup_n_s32( LMARK_H ), vmarkv = svdup_n_s32( LMARK_V );
+			const svint32_t zero = svdup_n_s32( 0 );
+			const svuint32_t lane = svindex_u32( 0, 1 ), last = svdup_n_u32( (unsigned)vl - 1 );
+			const svuint32_t ix1 = svsub_n_u32_x( pt, lane, 1 ), ix2 = svsub_n_u32_x( pt, lane, 2 ), ix4 = svsub_n_u32_x( pt, lane, 4 ), ix8 = svsub_n_u32_x( pt, lane, 8 );
+			const svbool_t ge1 = svcmpge_n_u32( pt, lane, 1 ), ge2 = svcmpge_n_u32( pt, lane, 2 ), ge4 = svcmpge_n_u32( pt, lane, 4 ), ge8 = svcmpge_n_u32( pt, lane, 8 );
+			svint32_t vmax = svdup_n_s32( rowmax ), cv = svdup_n_s32( tbest );
+#define LSVE_BLOCK( J ) \
+			{ \
+				svint32_t p = svld1_s32( pt, prev + (J) - 1 ); \
+				svint32_t v = svsub_s32_x( pt, svld1_s32( pt, prev + (J) - 2 ), svld1_s32( pt, kx + (J) - 2 ) ); \
+				svint32_t x, g, wm, ij, vmj; \
+				svbool_t ch, cvt, clamp; \
+				x = svmax_s32_m( ge1, v, svtbl_s32( v, ix1 ) ); \
+				x = svmax_s32_m( ge2, x, svtbl_s32( x, ix2 ) ); \
+				if( lsve_nstep > 2 ) x = svmax_s32_m( ge4, x, svtbl_s32( x, ix4 ) ); \
+				if( lsve_nstep > 3 ) x = svmax_s32_m( ge8, x, svtbl_s32( x, ix8 ) ); \
+				x = svmax_s32_x( pt, x, cv ); \
+				cv = svtbl_s32( x, last ); \
+				wm = p; \
+				g = svadd_s32_x( pt, x, svld1_s32( pt, kp + (J) - 2 ) );   /* hq + pen */ \
+				ch = svcmpgt_s32( pt, g, wm ); \
+				wm = svmax_s32_x( pt, wm, g ); \
+				vmj = svld1_s32( pt, vm + (J) ); \
+				g = svadd_s32_x( pt, vmj, vpen ); \
+				cvt = svcmpgt_s32( pt, g, wm ); \
+				wm = svmax_s32_x( pt, wm, g ); \
+				svst1_s32( pt, vm + (J), svadd_s32_x( pt, svmax_s32_x( pt, p, vmj ), vext ) ); \
+				svst1_s32( pt, wmrow + (J), wm ); \
+				vmax = svmax_s32_x( pt, vmax, wm ); \
+				clamp = svcmpgt_s32( pt, vthr, wm ); \
+				ij = svsel_s32( ch, vmarkh, zero ); \
+				ij = svsel_s32( cvt, vmarkv, ij ); \
+				ij = svsel_s32( clamp, vstop, ij ); \
+				wm = svmax_s32_x( pt, wm, vthr ); \
+				svst1_s32( pt, ijrow + (J), ij ); \
+				svst1_s32( pt, cur + (J), svadd_s32_x( pt, wm, svld1_s32( pt, profrow + (J) ) ) ); \
+			}
+			for( ; j+2*vl-1<=lgth2; j+=2*vl )
+			{
+				LSVE_BLOCK( j )
+				LSVE_BLOCK( j+vl )
+			}
+			for( ; j+vl-1<=lgth2; j+=vl )
+				LSVE_BLOCK( j )
+#undef LSVE_BLOCK
+			rowmax = svmaxv_s32( pt, vmax );
+			tbest = svlastb_s32( pt, cv );
+		}
+		else
+#endif
+		if( j == 4 )
+		{
+			/* 4 cells at a time, two blocks per iteration.  k*ext and k*ext+ext+pen come from tables
+			   (loads, not vector adds).  ij goes through an empty asm so that the compiler keeps
+			   the two selects instead of rebuilding them from and/or. */
+			const int32x4_t vpen = vdupq_n_s32( pen ), vext = vdupq_n_s32( ext ), vthr = vdupq_n_s32( ithr );
+			const int32x4_t vstop = vdupq_n_s32( lstop ), vmarkh = vdupq_n_s32( LMARK_H ), vmarkv = vdupq_n_s32( LMARK_V );
+			const int32x4_t ninf = vdupq_n_s32( INT_MIN );
+			int32x4_t vmax = vdupq_n_s32( rowmax ), cv = vdupq_n_s32( tbest );
+#define LNEON_BLOCK( J ) \
+			{ \
+				int32x4_t p = vld1q_s32( prev + (J) - 1 ); \
+				int32x4_t v = vsubq_s32( vld1q_s32( prev + (J) - 2 ), vld1q_s32( kx + (J) - 2 ) ); \
+				int32x4_t x, g, wm, ij, vmj; \
+				uint32x4_t ch, cvt, clamp; \
+				x = vmaxq_s32( v, vextq_s32( ninf, v, 3 ) ); \
+				x = vmaxq_s32( x, vextq_s32( ninf, x, 2 ) ); \
+				x = vmaxq_s32( x, cv ); \
+				cv = vdupq_laneq_s32( x, 3 ); \
+				wm = p; \
+				g = vaddq_s32( x, vld1q_s32( kp + (J) - 2 ) );   /* hq + pen */ \
+				ch = vcgtq_s32( g, wm ); \
+				wm = vmaxq_s32( wm, g ); \
+				vmj = vld1q_s32( vm + (J) ); \
+				g = vaddq_s32( vmj, vpen ); \
+				cvt = vcgtq_s32( g, wm ); \
+				wm = vmaxq_s32( wm, g ); \
+				vst1q_s32( vm + (J), vaddq_s32( vmaxq_s32( p, vmj ), vext ) ); \
+				vst1q_s32( wmrow + (J), wm ); \
+				vmax = vmaxq_s32( vmax, wm ); \
+				clamp = vcgtq_s32( vthr, wm ); \
+				ij = vandq_s32( vreinterpretq_s32_u32( ch ), vmarkh ); \
+				LNEON_OPAQUE( ij ); \
+				ij = vbslq_s32( cvt, vmarkv, ij ); \
+				LNEON_OPAQUE( ij ); \
+				ij = vbslq_s32( clamp, vstop, ij ); \
+				wm = vmaxq_s32( wm, vthr ); \
+				vst1q_s32( ijrow + (J), ij ); \
+				vst1q_s32( cur + (J), vaddq_s32( wm, vld1q_s32( profrow + (J) ) ) ); \
+			}
+#define LNEON_OPAQUE( r ) __asm__( "" : "+w"( r ) )
+			for( ; j+7<=lgth2; j+=8 )
+			{
+				LNEON_BLOCK( j )
+				LNEON_BLOCK( j+4 )
+			}
+			for( ; j+3<=lgth2; j+=4 )
+				LNEON_BLOCK( j )
+#undef LNEON_BLOCK
+#undef LNEON_OPAQUE
+			rowmax = vmaxvq_s32( vmax );
+			tbest = vgetq_lane_s32( cv, 0 );
+		}
+#else
 		{
 			/* prefix max with in-lane byte shifts (vpslldq) and the fill OR-ed in, one vpermd for the
 			   half carry; blends are and/xor (vpblendvb is two port-5 uops on Haswell/Broadwell). */
@@ -450,6 +624,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 			}
 			if( j > 1 ) tbest = _mm256_cvtsi256_si32( cv );
 		}
+#endif
 		/* the remaining cells */
 		for( jj=j; jj<=lgth2; jj++ )
 		{
@@ -478,6 +653,13 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 		}
 		if( rowmax > maxwm )
 		{
+#if defined(__ARM_NEON)
+			/* first cell holding rowmax, 4 at a time (it is always present) */
+			int32x4_t vr = vdupq_n_s32( rowmax );
+			j = 1;
+			for( ; j+3<=lgth2; j+=4 )
+				if( vmaxvq_u32( vceqq_s32( vld1q_s32( wmrow + j ), vr ) ) ) break;
+#else
 			/* first cell holding rowmax, 8 at a time (it is always present) */
 			__m256i vr = _mm256_set1_epi32( rowmax );
 			j = 1;
@@ -486,6 +668,7 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 				int km = _mm256_movemask_ps( _mm256_castsi256_ps( _mm256_cmpeq_epi32( _mm256_loadu_si256( (__m256i *)( wmrow + j ) ), vr ) ) );
 				if( km ) { j += __builtin_ctz( (unsigned)km ); break; }
 			}
+#endif
 			for( ; wmrow[j] != rowmax; j++ )
 				;
 			maxwm = rowmax; endali = i; endalj = j;
@@ -494,6 +677,9 @@ static int Lfill_int( double **amino_dynamicmtx, double **n_dynamicmtx, double s
 	}
 
 	free( profbuf ); free( vmraw ); free( hq ); free( wmrow );
+#if defined(__ARM_NEON)
+	free( kx );
+#endif
 	*maxwmpt = (double)maxwm;
 	*endalipt = endali;
 	*endaljpt = endalj;
