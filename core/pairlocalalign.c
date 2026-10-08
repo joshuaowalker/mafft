@@ -1945,7 +1945,7 @@ static double score2dist( double pscore, double selfscore1, double selfscore2)
 
 #if enablemultithread
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(MAFFT_CUDA)
 #include "l11gpu.h"
 /*
  * GPU precompute for the all-pairs local alignments (alg 'L').  Every pair that pairalign()
@@ -2050,7 +2050,7 @@ static void gpupairs_free( void )
 /* L__align11( n_dis_consweight_multi, 0.0, ... ) for the pair (i,j) of pairalign() */
 static double L__align11_pair( int i, int j, char **mseq1, char **mseq2, int alloclen, int *off1pt, int *off2pt )
 {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(MAFFT_CUDA)
 	if( gpupairs && i < j && j < gpun )
 	{
 		l11res *r = gpupairs + gpuidx( i, j );
@@ -2728,7 +2728,7 @@ static void pairalign( char **name, int *nlen, char **seq, char **aseq, char **d
 //		fprintf( stderr, "selfscore[%d] = %f\n", i, selfscore[i] );
 	}
 
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(MAFFT_CUDA)
 	gpupairs_prepare( njob, seq, targetmap, alloclen );
 #endif
 #if enablemultithread
@@ -3108,7 +3108,7 @@ static void pairalign( char **name, int *nlen, char **seq, char **aseq, char **d
 		}
 		if( dynamicmtx ) FreeDoubleMtx( dynamicmtx );
 	}
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(MAFFT_CUDA)
 	gpupairs_free();
 #endif
 

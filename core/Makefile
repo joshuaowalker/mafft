@@ -55,6 +55,20 @@ endif
 
 MYCFLAGS = $(MNO_CYGWIN) $(ENABLE_MULTITHREAD) $(ENABLE_ATOMIC) $(STDF) $(CFLAGS)
 
+# make CUDA=1: the all-pairs local alignments of L-INS-i (pairlocalalign.c) on an NVIDIA GPU
+# (l11gpu.cu).  Needs nvcc; CUDA_HOME, NVCC and CUDA_ARCH can be overridden.  Without CUDA=1
+# nothing below changes the build.  At run time MAFFT_NOGPU=1, or no usable GPU, uses the CPU.
+ifeq ($(CUDA),1)
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+CUDA_ARCH ?= -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 \
+             -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 \
+             -gencode arch=compute_90,"code=[sm_90,compute_90]"
+GPUOBJ = l11gpu_cuda.o
+GPULIBS = -L$(CUDA_HOME)/lib64 -lcudart_static -ldl -lrt -lpthread -lstdc++
+MYCFLAGS += -DMAFFT_CUDA
+endif
+
 INSTALL = install
 
 STRIP = strip
@@ -473,6 +487,9 @@ contrafoldwrap.o : contrafoldwrap.c $(HEADER)
 
 l11gpu.o : l11gpu.m l11gpu.h l11gpu_src.h l11gpu_lib.h
 	$(CC) -O2 -fobjc-arc -c l11gpu.m
+
+l11gpu_cuda.o : l11gpu.cu l11gpu.h
+	$(NVCC) -O3 $(CUDA_ARCH) -Xptxas -warn-spills -c l11gpu.cu -o $@
 
 l11gpu_src.h : l11gpu.metal
 	{ echo "static const unsigned char l11gpu_source[] = {"; xxd -i < l11gpu.metal; echo "};"; } > $@
