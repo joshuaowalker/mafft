@@ -51,7 +51,7 @@ and carrying each workstream's techniques to the other platforms made every mach
 faster than opt7: 1.35$\times$ on AMD Zen~4 and Intel Sapphire Rapids with unchanged build
 flags, 1.24$\times$ for the AVX2 server's build class, 1.22$\times$ on the M1 and 1.05$\times$ on
 Graviton4. On production fungal ITS alignments, L-INS-i now runs 8.1$\times$ faster than stock in
-a single run on the M1, 7.5--9.8$\times$ faster at four concurrent alignments on recent AWS x86
+a single run on the M1 (5.1$\times$ at eight concurrent), 7.5--9.8$\times$ faster at four concurrent alignments on recent AWS x86
 instances, about 5$\times$ on Graviton, and 5.9$\times$ on an AVX2-only host. A CUDA port of the
 GPU stage adds 1.24$\times$ but does not pay on AWS. Every output of every build in every test
 was byte-identical to its stock reference; the one discrepancy the work introduced, a rounding
@@ -1176,8 +1176,14 @@ the roughly 12 it takes with stock MAFFT at the same concurrency.
 opt8 brought the M1 code that the other platforms had developed (Section~\ref{sec:opt8}). Six
 shards run singly, each once per build in two interleaved rounds, took 1{,}059.6\,s with Homebrew's
 stock 7.526 and 131.5\,s with opt8: 8.1$\times$ in wall time and 9.2$\times$ in CPU time, with all 24
-outputs identical to the stored references. The 8-way figure in Table~\ref{tab:wall4} has not
-been remeasured with opt8.
+outputs identical to the stored references. At the production setting, the 16 shards of
+Table~\ref{tab:wall4} at 8 concurrent, interleaved with stock and opt4 in two rounds with the
+order reversed in the second, took 332\,s with stock, 76\,s with opt4 and 65.5\,s with opt8 (CPU
+time 2{,}243, 425 and 354\,s): 5.1$\times$ over stock in wall time and 6.3$\times$ in CPU time, and
+1.16$\times$ over opt4, with all 96 outputs identical to the references. Background load from the
+OS was higher than in Table~\ref{tab:wall4} (other processes used 0.6--1.4 cores, more during the
+optimized batches than during stock), so opt4's ratio came out at 4.4$\times$ rather than
+4.6$\times$.
 
 \subsection{x86}
 
@@ -1264,13 +1270,13 @@ load, as above. Where opt8 was not run on a machine, the table gives opt7.
 \centering
 \caption{Speedup over stock 7.526 built the same way on the same machine, L-INS-i on production
 ITS shards, \code{-{}-thread 1} per run: 16 shards at four concurrent and two shards run singly
-(on the M1: six shards singly).}
+(on the M1: 8 concurrent, and six shards singly).}
 \label{tab:allarch}
 \begin{tabular}{llrr}
 \toprule
 Machine & Build & 16 shards, 4 concurrent & Single runs \\
 \midrule
-Apple M1, with the Metal GPU & opt8 & & 8.1$\times$ \\
+Apple M1, with the Metal GPU & opt8 & 5.1$\times$$^\ddagger$ & 8.1$\times$ \\
 c7a (Zen 4), clang+FMA & opt8 & 8.6$\times$$^*$ & 10.5$\times$$^*$ \\
 c7i (Sapphire Rapids), clang+FMA & opt8 & 7.5$\times$$^*$ & 8.1$\times$$^*$ \\
 c8a (Zen 5), clang+FMA & opt7 & 9.8$\times$ & 12.2$\times$ \\
@@ -1283,7 +1289,8 @@ Zen 3 host, AVX2 only, gcc & opt8 & 5.9$\times$ & 7.1$\times$ \\
 \quad FFT-NS-i (\code{-{}-maxiterate 1000}) & opt8 & 2.6$\times$ & \\
 \bottomrule
 \multicolumn{4}{l}{\footnotesize $^*$Stock timed on the same instance type in an earlier session (Table~\ref{tab:x86four}; Table~\ref{tab:opt7} for c8g).}\\
-\multicolumn{4}{l}{\footnotesize $^\dagger$Against stock built with gcc, which is 2--6\% slower than stock built with clang.}
+\multicolumn{4}{l}{\footnotesize $^\dagger$Against stock built with gcc, which is 2--6\% slower than stock built with clang.}\\
+\multicolumn{4}{l}{\footnotesize $^\ddagger$At 8 concurrent, the production setting on the M1.}
 \end{tabular}
 \end{table}
 

@@ -36,7 +36,7 @@ row gives the most recent version that was.
 
 | machine | workload | version | several runs at once | single run |
 |---|---|---|---|---|
-| Apple M1 (macOS), clang, with the Metal GPU | pipeline L-INS-i | opt8 (single), opt4 (8 at once) | 4.6× | 8.1× |
+| Apple M1 (macOS), clang, with the Metal GPU | pipeline L-INS-i | opt8 | 5.1× | 8.1× |
 | AWS c7a (AMD Zen 4), clang | pipeline L-INS-i | opt8 | 8.6×&nbsp;† | 10.5×&nbsp;† |
 | AWS c7i (Intel Sapphire Rapids), clang | pipeline L-INS-i | opt8 | 7.5×&nbsp;† | 8.1×&nbsp;† |
 | AWS c8a (AMD Zen 5), clang | pipeline L-INS-i | opt7 | 9.8× | 12× |
