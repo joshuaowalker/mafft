@@ -16,3 +16,13 @@ without `--quiet`).
 The marker fill is checked by `harness/opt6/marks_check.py` (x86) or `harness/arm64/marks_check.py`
 (arm64, which also gates the NEON and SVE loops).  The scripts can be combined in one copy.  For
 the all-pairs fill on Apple silicon, run with `MAFFT_NOGPU=1` so the CPU fill does every pair.
+
+## Which harnesses apply to which tag
+
+Each harness directory was written against the source of the tag it verified, and patches
+that source by matching its text. Against opt8, these were run: the four scripts above,
+`harness/opt6/marks_check.py`, `harness/arm64/marks_check.py`, `harness/x86/igsx_check.py` and
+`harness/cuda/l11gpu_check.py`. The other `harness/x86`, `harness/arm64` and `harness/cuda`
+scripts verify `v7.526-opt7`, and `harness/opt5` verifies `v7.526-opt5`; several no longer
+apply to opt8, whose shared code replaced what they patch. Run each against its own tag (with
+`git archive`).

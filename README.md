@@ -20,25 +20,29 @@ The changes come from two projects that align fungal ITS sequences in production
 - **A phylogenetics pipeline** running L-INS-i (`--localpair --maxiterate 1000`) on
   alignments of typically about 180 sequences, on an Apple M1 and on AWS x86 instances with
   AVX-512 (opt1–opt6), then extended to more AWS architectures (opt7): Graviton (Linux
-  arm64), AMD Zen 5, Intel Granite Rapids, and NVIDIA GPUs with CUDA.
+  arm64), AMD Zen 5, Intel Granite Rapids, and NVIDIA GPUs with CUDA. opt8 consolidates
+  the per-architecture code into shared, portable paths.
 - **[Dikarya](https://dikarya.us)**, a phylogenetics web service for fungal ITS barcodes,
   running `--auto` (mostly L-INS-i-style local pairs, sometimes FFT-NS-i) on a Broadwell
   server without AVX-512 (`dikarya1`).
 
 The same source tree builds for all of these machines. Each vector path is chosen at compile
-time, and every other target keeps the code it had before.
+time; the algorithmic changes are shared by every target where they are exact.
 
 ## Results
 
 | platform | build | workload | speedup vs. stock 7.526 |
 |---|---|---|---|
-| Apple M1 (macOS) | `v7.526-opt4` and later (same arm64 code) | pipeline L-INS-i | 6.5× single run, 4.6× at 8 concurrent runs |
+| Apple M1 (macOS) | `v7.526-opt4` to `opt7` (same arm64 code) | pipeline L-INS-i | 6.5× single run, 4.6× at 8 concurrent runs |
+| Apple M1 (macOS) | `v7.526-opt8` | pipeline L-INS-i | a further 1.22× over opt7 in single runs (see [opt8](#opt8-one-tree-shared-code)) |
 | AWS c7i / c7a (Sapphire Rapids, Zen 4), clang | `v7.526-opt5` | pipeline L-INS-i | 5.7–7.0× single run, 5.1–5.9× at 4 concurrent runs |
 | AWS c7a / c7i (Zen 4, Sapphire Rapids), clang | `v7.526-opt6` | pipeline L-INS-i | a further 5% faster than opt5 at 4 concurrent runs on both; 9% (c7a) and 4% (c7i) in a single run (see [opt6](#opt6-the-marker-fill-on-avx-512)) |
 | AWS c8a (AMD Zen 5), clang | `v7.526-opt7`, new x86 flags | pipeline L-INS-i | 9.8× at 4 concurrent runs, 12× single run; 1.6× over opt6 (see [opt7](#opt7-more-architectures)) |
 | AWS c8i (Intel Granite Rapids), clang | `v7.526-opt7`, new x86 flags | pipeline L-INS-i | 8.2× at 4 concurrent runs, 9.3× single run; 1.4× over opt6 |
 | AWS c8g / c7g (Graviton4 / Graviton3), clang | `v7.526-opt7` | pipeline L-INS-i | 4.8× / 5.1× at 4 concurrent runs, 5.4× / 5.6× single run; 1.3–1.4× over opt6 |
 | AWS g4dn (NVIDIA T4, Cascade Lake host), clang + CUDA | `v7.526-opt7`, `CUDA=1` | pipeline L-INS-i | 5.8× at 4 concurrent runs; the GPU adds 1.2× over the CPU-only build |
+| AWS c7a / c7i (Zen 4, Sapphire Rapids), clang | `v7.526-opt8`, `-march=x86-64-v4` | pipeline L-INS-i | 1.35× over opt6/opt7 at 4 concurrent runs on both, with the production flags unchanged |
+| AWS g6 host (AMD Zen 3, AVX2, no AVX-512), gcc `-march=broadwell` | `v7.526-opt8` | pipeline L-INS-i and FFT-NS-i | 5.9× at 4 concurrent runs, 7.1× single run, 2.6× FFT-NS-i; 1.2× over dikarya1 |
 | Intel Xeon E5-2690 v4 (Broadwell, AVX2, no AVX-512), gcc | `v7.526-opt5-dikarya1` | Dikarya `--auto` jobs | 6.4× on `--auto` local-pair jobs, 2.3× on `--auto` FFT-NS-i jobs, 5.5–6.9× on full L-INS-i (see [dikarya1](#dikarya1-avx2-for-x86-without-avx-512)) |
 
 The speedups depend on the workload and the hardware: sequence count and length, the
@@ -61,6 +65,7 @@ The changes are a linear series of commits on the `exact-speedups` branch, on to
 | `v7.526-opt5-dikarya1` | `v7.526-opt5-dikarya1` | AVX2 paths for x86-64 without AVX-512: marker-based `Lfill_int`, sparse `scarr_fill`, uncleared `Falign` work rows ([details](#dikarya1-avx2-for-x86-without-avx-512)) |
 | `v7.526-opt6` | `v7.526-opt6` | dikarya1's marker-based `Lfill_int` on AVX-512 builds too ([details](#opt6-the-marker-fill-on-avx-512)) |
 | `v7.526-opt7` | `v7.526-opt7` | Linux arm64 (NEON/SVE), x86 kernels for AVX-512 CPUs with VPOPCNTDQ and VBMI2, CUDA all-pairs stage, AVX2+FMA paths ([details](#opt7-more-architectures)) |
+| `v7.526-opt8` | `v7.526-opt8` | one feature-test header, portable algorithms shared by every target, the opt7 x86 kernels on every AVX-512 build ([details](#opt8-one-tree-shared-code)) |
 
 `v7.526-opt1` reports plain `v7.526`, so it can't be told apart from stock by version.
 Prefer a later tag.
@@ -82,8 +87,8 @@ They were written for, and measured on, the server that runs Dikarya:
 
 The new code is guarded by `__AVX2__ && !MAFFT_STOCK_FMA`, and by `!__AVX512F__` where opt5
 already had an AVX-512 path, so builds for other targets compiled exactly the code they did
-before. (opt6 later enabled the marker fill on AVX-512 builds as well. Builds without
-AVX-512 still compile exactly the dikarya1 code.)
+before. (opt6 later enabled the marker fill on AVX-512 builds as well, and opt8 shares more
+code with these builds; see [opt8](#opt8-one-tree-shared-code).)
 
 | where | change | effect on this machine |
 |---|---|---|
@@ -171,7 +176,7 @@ builds compiling the same objects as `v7.526-opt6`, apart from the version strin
 **x86 with newer AVX-512 (Zen 4+, Ice Lake+).** New kernels behind `MAFFT_AVX512X`, which is
 defined only when VPOPCNTDQ and VBMI2 are enabled (for example `-march=x86-64-v4
 -mavx512vpopcntdq -mavx512vbmi2`, or `-march=znver4`/`znver5`/`sapphirerapids`/
-`graniterapids`; plain `-march=x86-64-v4` does not enable them):
+`graniterapids`; plain `-march=x86-64-v4` does not enable them in opt7, but does from opt8 on):
 
 - a striped (Farrar-layout) integer local-alignment fill: the horizontal-gap state is a running
   maximum along each lane plus a carry taken from the previous row, so there is no prefix scan
@@ -227,7 +232,7 @@ Lake, 2 cores with 2 threads), 16 shards at 4 concurrent took 895 s with stock, 
 opt7 on the CPU and 154 s with the GPU: about $1.40 per 1,000 shards, against about $0.11 on
 a c8a.xlarge with opt7. The GPU path is for machines with a strong CPU and an idle GPU.
 
-**Alan's AVX2 build is unchanged by default.** Two AVX2 passes added in opt7 (`gapruns` and
+**Alan's AVX2 build is unchanged by default** (in opt7; opt8 changes it, see below). Two AVX2 passes added in opt7 (`gapruns` and
 `alignableReagion`, 32 bytes at a time) would change the objects of the gcc AVX2 build that
 dikarya1 verified on its Broadwell server. In that (non-contracting) class they are opt-in:
 build with `-DMAFFT_AVX2_EXTRA=1` to try them, and compare with `harness/avx2/compare-builds.sh`
@@ -245,6 +250,105 @@ before relying on them. They were verified on AVX2-capable AWS CPUs, not on Broa
 | all four | gcc | = stock gcc on the 43-shard subset | |
 | g4dn (T4) | clang+FMA `-march=x86-64-v4` + `CUDA=1` | 183/183 = Mac reference | 25/25; also 25/25 for the AVX2+FMA builds with and without CUDA |
 | g4dn (T4) | gcc AVX2 + `CUDA=1`, default and with `-DMAFFT_AVX2_EXTRA=1` | = stock gcc on the 13 canary windows (both) | |
+
+### opt8: one tree, shared code
+
+opt7 was three workstreams merged side by side, so the same idea often appeared in several
+per-architecture copies, each behind its own spelling of the feature test. opt8 consolidates
+them without changing any build's output:
+
+- **One header for the feature tests.** `core/mafft_simd.h` decides once which vector code a
+  build compiles (`MAFFT_A64`, `MAFFT_SVE`, `MAFFT_SSE41`, `MAFFT_AVX2`, `MAFFT_AVX512`,
+  `MAFFT_AVX512_VBMI2`, `MAFFT_STOCK_FMA`) and defines the multiply-adds that round like the
+  stock build. The rest of `core/` tests only these macros.
+- **Portable algorithms on every target.** The sparse `scarr_fill`, the banded `fillimp_track`
+  walk and the written-range importance-matrix gather (one 2 MB-aligned allocation, huge pages
+  on Linux), the run-based `commongappick`, the deferred end-cell search of the all-pairs
+  fill, and dikarya1's marker fill (now also on Apple silicon) each exist once, with small
+  ISA-specific inner loops where they pay. Builds without vector extensions run the same
+  algorithms in scalar code.
+- **One skeleton for the byte-scanning passes.** `gapruns`, `makeresmap`, `cpmx_calc_new` and
+  `alignableReagion` had separate AVX-512, AVX2 and NEON copies. They now share one loop over
+  byte-compare masks (`mafft_bm_eq`: 64 bytes at a time on AVX-512, 32 on AVX2, 16 on NEON)
+  with a scalar tail.
+- **The opt7 x86 kernels on every AVX-512 build.** The striped all-pairs fill, the 8-column
+  `match_calc` and the popcount pair scores need only AVX-512 F/BW/VL, so plain
+  `-march=x86-64-v4` now gets them. Only the traceback-row expand uses VBMI2, with a scalar
+  version otherwise.
+- **Removed:** the AVX-512 and AVX2 prefix-scan fills that opt6 made unreachable, the
+  duplicated allocators and row loops, and `MAFFT_AVX2_EXTRA` (see below). `core/` is about
+  800 lines smaller than opt7.
+- **Fixed:** two call sites added in dikarya1 (`SAalignmm.c`, `Lalign11.c`) passed an `int **`
+  matrix to `scarr_fill`, which takes `double **`. Neither is reachable from the strategies
+  MAFFT runs, so no output was affected; they now use the original loops.
+
+Some ideas were measured per platform rather than shared blindly: Linux arm64 keeps its NEON
+table-lookup pair scores (faster there than the popcount masks), and the byte-mask passes
+split mixed blocks into per-character adds only on AVX-512.
+
+**Alan's AVX2 build changes.** Unlike opt6 and opt7, opt8 changes the objects of the gcc AVX2
+build that dikarya1 measured on its Broadwell server: it now compiles the shared byte-mask
+passes, the banded walk and the written-range gather. It was checked in that class on an AMD
+Zen 3 host (AVX2, no AVX-512) with gcc `-O3 -march=broadwell`:
+
+- All 183 test shards gave alignments identical to dikarya1 built the same way, and the 13
+  canary windows matched stock 7.526 built the same way. (Earlier, gcc `-march=x86-64-v3` and
+  `x86-64-v4` builds on Zen 4 matched stock gcc on a 43-shard subset.)
+- opt8 was 1.24× faster than dikarya1 on L-INS-i at 4 concurrent runs, 1.22× on single runs,
+  and 1.23× on FFT-NS-i (`--maxiterate 1000`, 16 shards: 28.5 s against 35 s, outputs
+  identical).
+- Against stock 7.526 built the same way (642 s at 4 concurrent, 88 + 127 s single, 74 s
+  FFT-NS-i), dikarya1 was 4.7×, 5.8× and 2.1× faster, and opt8 5.9×, 7.1× and 2.6×. The
+  dikarya1 ratios are close to those measured on the Broadwell server (6.7× on single L-INS-i
+  runs, 2.3× on FFT-NS-i), so this host is a fair stand-in for it.
+
+Performance on Broadwell itself has not been measured. If it regresses there,
+`v7.526-opt7` and `v7.526-opt5-dikarya1` still build the earlier code.
+
+**Results** (same method as above: 16 shards at 4 concurrent, wall / CPU, and 2 single shards;
+opt7 and opt8 interleaved in the same session):
+
+| machine, build | `v7.526-opt7`: 16 shards, 4 concurrent | `v7.526-opt8` | opt7: 2 single shards | opt8: 2 single shards |
+|---|---|---|---|---|
+| c7a (Zen 4), clang+FMA `-march=x86-64-v4` | 65.0 s / 246 s | **48.0 s / 180 s** | 11.0 + 15.9 s | 8.2 + 11.6 s |
+| c7a, adding `-mavx512vpopcntdq -mavx512vbmi2` | 46.3 s / 171 s | 47.0 s / 174 s | 7.9 + 10.9 s | 8.0 + 11.2 s |
+| c7i (Sapphire Rapids), clang+FMA `-march=x86-64-v4` | 107.7 s / 415 s | **79.7 s / 303 s** | 12.5 + 18.2 s | 9.3 + 13.2 s |
+| c7i, adding `-mavx512vpopcntdq -mavx512vbmi2` | 76.7 s / 293 s | 76.7 s / 293 s | 8.8 + 12.6 s | 9.1 + 12.9 s |
+| c8g (Graviton4), clang `-mcpu=neoverse-v1` | 80 s / 302 s | 76 s / 288 s | 13.8 + 18.8 s | 13.3 + 18.0 s |
+| g6 host (AMD Zen 3, AVX2 only), gcc `-march=broadwell` (Alan's class; opt7 = dikarya1 here) | 135.5 s / 512 s | **109.5 s / 415 s** | 15.0 + 21.9 s | 12.5 + 17.6 s |
+
+At `-march=x86-64-v4`, opt7 compiles the same objects as opt6, so on c7a and c7i opt8 is 1.35×
+faster than opt6 and opt7 with the production flags unchanged. With
+the extra flags, opt7's separate kernels were up to 2% faster than opt8's shared ones on these
+two machines; that was accepted for the simpler tree. On the Apple M1 (6 L-INS-i shards, each
+run once per build, two interleaved rounds, `--thread 1`), opt8 took 132 s against opt7's 162 s
+(1.22×). The M1 build now also runs the shared byte-mask passes, the marker fill and the banded
+walk, which it did not have before.
+
+**CUDA, again.** On a g6.xlarge (NVIDIA L4; host AMD Zen 3, 4 vCPUs), opt8 clang+FMA
+`-march=x86-64-v3` took 99 s on the CPU alone and 80 s with `CUDA=1` (16 shards at 4 concurrent;
+single shards 11.7 + 16.6 s against 8.8 + 13.6 s). The GPU adds 1.24×, as it did on the T4,
+and was idle in most 5-second samples. The conclusion from opt7 stands: at on-demand prices
+that is about $1.10 per 1,000 shards, against about $0.17 on a c7a.xlarge with opt8.
+
+**Verification.** New per-call harnesses in `harness/opt8` (byte-mask passes, banded walk,
+`scarr_fill`, the striped fill's traceback), plus the opt6/arm64 marker-fill checks, the x86
+pair-score check and the CUDA all-pairs check, run with L-INS-i under three gap settings,
+`test/sample`, FFT-NS-i and the placement cases. Then the final tree:
+
+| machine | build | per-call harnesses | 183 test shards | canary (13 windows + 12 placements) |
+|---|---|---|---|---|
+| Apple M1 | clang (also with `MAFFT_NOGPU=1`) | 19 runs, all identical | 12 timing runs = Mac reference | 25/25; 13/13 with the GPU off |
+| c7a (Zen 4) | clang+FMA `-march=x86-64-v4`, and with VPOPCNTDQ/VBMI2 | 228 runs (incl. gcc `-march=x86-64-v3`), all identical | 183/183 = Mac reference (both) | 25/25 (both) |
+| c7a (Zen 4) | gcc `-march=x86-64-v3` and `x86-64-v4` | | = stock gcc on the 43-shard subset | |
+| c7i (Sapphire Rapids) | the c7a binaries | | | 25/25 (both) |
+| c8g (Graviton4) | clang `-mcpu=neoverse-v1`; gcc | 163 runs, all identical | 183/183 = Mac reference | |
+| g6 (NVIDIA L4, AMD Zen 3 host) | clang+FMA `-march=x86-64-v3` + `CUDA=1` | 733,956 GPU pairs, 0 mismatches | 183/183 = Mac reference | 25/25, with and without the GPU |
+| g6 (Zen 3 host, AVX2 only) | gcc `-march=broadwell` (Alan's class) | | 183/183 = dikarya1 | 13/13 windows = stock gcc 7.526 |
+
+Some of these runs were on an earlier opt8 commit, before the final tuning commit: the M1
+harness runs, 180 of the c7a runs, 135 of the c8g runs, and the gcc subset on c7a. Everything
+else ran on the final tree.
 
 ## What "identical to stock" means
 
@@ -272,21 +376,16 @@ The build is the same as upstream (see below), with these additions:
   Accelerate and Metal automatically. If Xcode's Metal compiler is installed, the GPU kernel
   is compiled at build time; otherwise MAFFT compiles it at run time. Setting `MAFFT_NOGPU=1`
   disables the GPU path.
-- **x86-64 with AVX-512** (verified on Intel Sapphire Rapids and AMD Zen 4):
+- **x86-64 with AVX-512** (opt8 verified on AMD Zen 4 and Intel Sapphire Rapids; earlier tags
+  also on Zen 5 and Granite Rapids). From opt8 on, this gets the opt7 x86 kernels:
 
       cd core
       make CC=clang CFLAGS="-O3 -march=x86-64-v4 -DMAFFT_STOCK_FMA=1"
       make install
 
-- **x86-64 with AVX-512 and VPOPCNTDQ/VBMI2** (Zen 4 and later, Ice Lake and later; verified
-  on AMD Zen 5 and Intel Granite Rapids). This enables opt7's x86 kernels:
-
-      cd core
-      make CC=clang CFLAGS="-O3 -march=x86-64-v4 -mavx512vpopcntdq -mavx512vbmi2 -DMAFFT_STOCK_FMA=1"
-      make install
-
-  These flags were not yet measured on Zen 4 (AWS c7a) or Sapphire Rapids (c7i), which also
-  have both extensions; until they are, those machines keep the `-march=x86-64-v4` build.
+  On CPUs with VBMI2 (Zen 4 and later, Ice Lake and later), adding `-mavx512vpopcntdq
+  -mavx512vbmi2` enables a vector traceback-row expand. On Zen 4 it was about 2% faster than
+  the plain build.
 - **Linux arm64** (verified on AWS Graviton3 and Graviton4 with clang 15; one binary for both):
 
       cd core
@@ -296,16 +395,16 @@ The build is the same as upstream (see below), with these additions:
 - **NVIDIA GPU**: add `CUDA=1` to `make` and `make install` on any x86 or arm64 Linux build
   (needs the CUDA toolkit; `CUDA_HOME`, `NVCC` and `CUDA_ARCH` can be set). Verified on
   NVIDIA L4 and T4.
-- **x86-64 with AVX2 but no AVX-512** (verified on Intel Broadwell with gcc 13.3, and with
-  gcc 11.5 `-march=x86-64-v3` on AMD Zen 4):
+- **x86-64 with AVX2 but no AVX-512** (dikarya1 verified on Intel Broadwell with gcc 13.3;
+  opt8 verified with gcc `-march=broadwell` on AMD Zen 3 and `-march=x86-64-v3` on Zen 4):
 
       cd core
       make CC=gcc CFLAGS="-O3 -march=native"
       make install
 
-- **Other targets.** The vector paths are selected at compile time (`__ARM_NEON`,
-  `__AVX512F__`/`__AVX512BW__`/`__AVX512VL__`, `__AVX2__`, `__SSE4_1__`). Without them, the
-  original scalar code is used, along with the portable algorithmic changes. These
+- **Other targets.** The vector paths are selected at compile time from the compiler's
+  target macros, in one place (`core/mafft_simd.h`). Without them, the portable algorithms
+  run in scalar code. These
   configurations compile but were not verified. Before relying on one, compare its output
   with a stock build made by the same compiler (`harness/avx2/compare-builds.sh` does this
   over six option sets).
@@ -319,10 +418,12 @@ Only `core/` changed. `extensions/` is identical to upstream.
 ## For the MAFFT maintainers
 
 The branch is upstream `main` (`0a2319b`, the newest official source as of 2026-10-07) plus
-this series, so `git diff 0a2319b v7.526-opt7 -- core/` is the whole change against upstream.
+this series, so `git diff 0a2319b v7.526-opt8 -- core/` is the whole change against upstream.
 Each tag's diff against the one before is one part of the work, for example
-`git diff v7.526-opt5 v7.526-opt5-dikarya1 -- core/` for the AVX2 part. Each part keeps the
-original code as the fallback for every other target.
+`git diff v7.526-opt5 v7.526-opt5-dikarya1 -- core/` for the AVX2 part. Up to opt7 each part kept the
+original code as the fallback for every other target; opt8 replaces several of those fallbacks
+with shared portable versions, so `git diff v7.526-opt7 v7.526-opt8 -- core/` is mostly
+consolidation. The feature tests are all in `core/mafft_simd.h`.
 
 ## Credits and license
 
@@ -338,6 +439,8 @@ original code as the fallback for every other target.
   Anthropic) agents working in parallel, one per architecture, merged and verified by a
   coordinating Claude Code session, with Josh Walker advising and setting the research
   direction.
+- **opt8** (consolidation into shared code): Claude Code (Claude Opus 5.5, Anthropic), with
+  Josh Walker advising.
 - MAFFT itself is by Kazutaka Katoh and colleagues. Please cite MAFFT as its authors ask
   (see the official site).
 
@@ -346,8 +449,10 @@ changes in this fork are offered under the same license. `extensions/` is covere
 [`license.extensions`](license.extensions).
 
 The per-call verification harnesses are in [`harness/`](harness): `opt5` for the AVX-512
-kernels, `avx2` for whole-build comparisons, `opt6` for the marker fill, and `x86`, `arm64`
-and `cuda` for opt7.
+kernels, `avx2` for whole-build comparisons, `opt6` for the marker fill, `x86`, `arm64` and
+`cuda` for opt7, and `opt8` for the shared code. Each was written for the tag it verifies; the
+scripts that were run against opt8 are listed in [`harness/opt8/README.md`](harness/opt8/README.md).
+`harness/objcheck.sh` compares the objects two trees compile, configuration by configuration.
 
 ---
 
