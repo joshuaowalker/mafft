@@ -40,7 +40,8 @@ inputs, because Apple's clang fuses multiply-adds and gcc does not, while a clan
 FMA on x86 reproduces the Mac's alignments. ``Identical to stock'' must therefore name the
 stock build's rounding class.
 
-A collaborator's build for an AVX2 server without AVX-512 (dikarya1) contributed an integer
+A build directed by Alan Rockefeller for Dikarya, a web service running on an AVX2 server
+without AVX-512 (dikarya1), contributed an integer
 local-alignment fill that stores markers in place of gap offsets and recovers them during
 traceback. It was faster on AVX-512 too (opt6), and prompted a broader exploration. For opt7,
 three AI agents worked in parallel, one per architecture (AWS Graviton, AMD Zen~5 and Intel
@@ -87,8 +88,8 @@ gives different alignments from stock MAFFT on the Mac for a third of the inputs
 build that fuses multiply-adds the way Apple's compiler does agrees with it
 (Section~\ref{sec:xplat}).
 
-After the series was published, a collaborator's build for an AVX2-only server (dikarya1,
-Section~\ref{sec:dikarya}) contributed a new local-alignment fill that also made our own x86
+After the series was published, Alan Rockefeller directed a build for the AVX2-only server of
+the Dikarya web service (dikarya1, Section~\ref{sec:dikarya}), which contributed a new local-alignment fill that also made our own x86
 build faster (opt6). That prompted a broader experiment: three AI agents, one per architecture,
 optimizing in parallel under the same contract (opt7, Section~\ref{sec:opt7}), followed by a
 consolidation of their work into one shared, mostly portable tree (opt8,
@@ -613,7 +614,7 @@ local pairs, sometimes FFT-NS-i). The service runs on an Intel Xeon E5-2690 v4 (
 two vCPUs of a virtual machine, AVX2 and FMA, no AVX-512), built with gcc 13.3 and
 \code{-march=native}; we call it the Dikarya host. The work, tagged \code{v7.526-opt5-dikarya1}
 (``dikarya1''), was designed, implemented, verified and benchmarked by Claude Code (Claude
-Opus 5.5), with Alan Rockefeller directing it, under the same exactness rule as the rest of
+Opus 5.5), with Rockefeller directing it, under the same exactness rule as the rest of
 the series. gcc never contracts multiply-adds in this build (Section~\ref{sec:xplat}), so
 every vector multiply-add below is a separate multiply and add.
 
@@ -681,7 +682,7 @@ $2.8\times10^{11}$ cells per build, in three builds), and opt6 matched the clang
 on all 183 shards on both instance types. Builds without AVX-512 compiled exactly dikarya1's
 objects.
 
-A collaborator's work for different hardware had made our own production build faster. That
+Rockefeller's work for different hardware had made our own production build faster. That
 prompted the next step: rather than port to one machine at a time, explore several
 architectures at once.
 
@@ -1383,8 +1384,8 @@ put each technique under test on every platform, and made every platform we meas
 since each gained what the others had found. It also needed measurement before sharing, as the Graviton
 regression showed. The parallel phase found the ideas; the consolidation spread them.
 
-The broadening began with a collaborator. Alan Rockefeller's dikarya1 work for Dikarya's AVX2
-server contributed the marker fill, which made our own x86 production build faster, and it
+The broadening began with Alan Rockefeller's dikarya1 work for Dikarya's AVX2 server. It
+contributed the marker fill, which made our own x86 production build faster, and it
 prompted us to explore more architectures, which paid off on every platform we measured,
 including the M1 where the series began.
 
