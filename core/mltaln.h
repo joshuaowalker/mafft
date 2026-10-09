@@ -88,6 +88,7 @@ extern int **amino_dis;
 extern double **n_disLN;
 //extern double amino_dis_consweight_multi[0x100][0x100];
 extern double **amino_dis_consweight_multi;
+extern int constants_generation;
 extern int **n_dis;
 extern int **n_disFFT;
 extern double **n_dis_consweight_multi;

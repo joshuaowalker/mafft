@@ -1004,6 +1004,7 @@ void cpmx_colmask( double **cpmx, int nalph, int lgth, unsigned int *mask )
 static int igs_pairscores( char **seq1, char **seq2, int clus1, int clus2, int len, double *out )
 {
 	static TLS double **tabsrc = NULL;
+	static TLS int tabgen = -1;
 	static TLS int integral = -1;
 	static TLS double *dz = NULL; /* D with gap row/column zeroed, indexed [a*256+b] */
 	static TLS int *dzi = NULL;   /* same, as int32, indexed [a*128+b] */
@@ -1014,9 +1015,12 @@ static int igs_pairscores( char **seq1, char **seq2, int clus1, int clus2, int l
 	double tmpscore, s, *colsum = NULL;
 	size_t stride = (size_t)len + 1, rstride = (size_t)len / 2 + 2;
 
-	if( tabsrc != amino_dis_consweight_multi )
+	/* The matrix can be freed and rebuilt at the same address (freeconstants(), then constants()
+	   with other settings, in a library host), so the generation decides, not the pointer. */
+	if( tabsrc != amino_dis_consweight_multi || tabgen != constants_generation )
 	{
 		tabsrc = amino_dis_consweight_multi;
+		tabgen = constants_generation;
 		/* amino_dis_consweight_multi may be only 0x80 x 0x80 (charsize); use 7-bit characters only. */
 		if( !dz ) dz = calloc( 0x10000, sizeof( double ) );
 		if( !dzi ) dzi = calloc( 0x4000, sizeof( int ) );

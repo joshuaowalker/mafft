@@ -1406,6 +1406,7 @@ void constants( int nseq, char **seq )
 
 	amino_dis = AllocateIntMtx( charsize, charsize );
 	amino_dis_consweight_multi = AllocateDoubleMtx( charsize, charsize );
+	constants_generation++;
 
 //	reporterr( "charsize=%d\n", charsize );
 

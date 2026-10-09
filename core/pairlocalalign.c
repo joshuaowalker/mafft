@@ -1943,8 +1943,6 @@ static double score2dist( double pscore, double selfscore1, double selfscore2)
 	return( val );
 }
 
-#if enablemultithread
-
 #if defined(__APPLE__) || defined(MAFFT_CUDA)
 #include "l11gpu.h"
 /*
@@ -2076,6 +2074,7 @@ static double L__align11_pair( int i, int j, char **mseq1, char **mseq2, int all
 	return( L__align11( n_dis_consweight_multi, 0.0, mseq1, mseq2, alloclen, off1pt, off2pt ) );
 }
 
+#if enablemultithread
 static void *athread( void *arg ) // alg='R', alg='r' -> tsukawarenai.
 {
 	thread_arg_t *targ = (thread_arg_t *)arg;

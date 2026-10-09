@@ -20,6 +20,7 @@ int **amino_dis = NULL;
 double **n_disLN = NULL;
 //double amino_dis_consweight_multi[0x100][0x100];
 double **amino_dis_consweight_multi = NULL;
+int constants_generation = 0; /* changes whenever constants() rebuilds the score matrices */
 int **n_dis = NULL;
 int **n_disFFT = NULL;
 double **n_dis_consweight_multi = NULL;
