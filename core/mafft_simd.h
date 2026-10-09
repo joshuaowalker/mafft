@@ -84,12 +84,6 @@
 /* 4 x 64-bit compare mask -> 4 x 32-bit mask */
 #define PACKMASK4(c) _mm256_castsi256_si128( _mm256_permutevar8x32_epi32( _mm256_castpd_si256( c ), _mm256_setr_epi32( 0, 2, 4, 6, 0, 2, 4, 6 ) ) )
 #endif
-/* AVX2 code that came after dikarya1 (the gapruns and alignableReagion passes).  In the
-   non-contracting (gcc) class it would change the objects of the dikarya1 build, which was
-   verified on its own hardware, so there it is opt-in: -DMAFFT_AVX2_EXTRA=1. */
-#if defined(MAFFT_AVX2) && ( MAFFT_STOCK_FMA || defined(MAFFT_AVX2_EXTRA) )
-#define MAFFT_AVX2_NEWPATHS 1
-#endif
 
 #if defined(MAFFT_AVX512)
 #if MAFFT_STOCK_FMA
@@ -197,15 +191,8 @@ static inline void mafft_bm_addmask( double *r, unsigned long long m, double v )
 
 /*
  * mafft_eq64( p, c ): bit k set when p[k] == c, for k < 64, one bit per byte, in every build
- * (p must have 64 readable bytes; mafft_eq64n handles a shorter tail of n bytes).
+ * (p must have 64 readable bytes; callers pad a shorter last word).
  */
-static inline unsigned long long mafft_eq64n( const unsigned char *p, int n, unsigned char c )
-{
-	unsigned long long m = 0;
-	int k;
-	for( k=0; k<n; k++ ) if( p[k] == c ) m |= 1ULL << k;
-	return( m );
-}
 #if defined(MAFFT_A64)
 /* the nibble mask of 16 bytes (bit 4k) packed into 16 bits (bit k) */
 static inline unsigned long long mafft_pack_nibbles( unsigned long long x )
@@ -227,7 +214,10 @@ static inline unsigned long long mafft_eq64( const unsigned char *p, unsigned ch
 	return( mafft_pack_nibbles( mafft_bm_eq( p, c ) ) | ( mafft_pack_nibbles( mafft_bm_eq( p + 16, c ) ) << 16 )
 	      | ( mafft_pack_nibbles( mafft_bm_eq( p + 32, c ) ) << 32 ) | ( mafft_pack_nibbles( mafft_bm_eq( p + 48, c ) ) << 48 ) );
 #else
-	return( mafft_eq64n( p, 64, c ) );
+	unsigned long long m = 0;
+	int k;
+	for( k=0; k<64; k++ ) if( p[k] == c ) m |= 1ULL << k;
+	return( m );
 #endif
 }
 
