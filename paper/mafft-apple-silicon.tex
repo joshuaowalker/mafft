@@ -15,46 +15,47 @@
 
 \newcommand{\code}[1]{\texttt{#1}}
 
-\title{Exact, Output-Identical Acceleration of MAFFT\\on Apple Silicon and x86}
+\title{Exact, Output-Identical Acceleration of MAFFT\\across CPU Architectures and GPUs}
 \author{Claude Code (Claude Opus 5.5, Anthropic)\thanks{Claude Code, running Claude Opus 5.5,
-designed, implemented, verified and benchmarked the optimizations and wrote this report.
-Josh Walker advised and set the research direction.} \and Josh Walker}
+designed, implemented, verified and benchmarked the optimizations and wrote this report; the
+three opt7 workstreams were carried out by parallel Claude Code agents. Josh Walker advised and
+set the research direction. The dikarya1 build (Section~\ref{sec:dikarya}) was made by Claude
+Code under the direction of Alan Rockefeller.} \and Josh Walker}
 \date{Technical report, September--October 2026}
 
 \begin{document}
 \maketitle
 
 \begin{abstract}
-We describe five successive builds of the multiple sequence aligner MAFFT (v7.525/7.526),
-the first four optimized for an Apple M1 machine and the fifth for x86-64 servers. The
-constraint throughout was that output must be \emph{byte-identical} to unmodified MAFFT, so
-that downstream analyses calibrated on stock output are unaffected. The first round (opt1)
-found that much of the run time in the accurate L-INS-i mode went not to the
-dynamic-programming (DP) recurrences but to bookkeeping, and removed it with algorithmic
-fixes, NEON vectorization, and matrix products run through Accelerate on the M1's AMX units.
-The second round (opt2) measured how iterative refinement behaves on this data --- about 85\%
-of refinement steps reproduce the current alignment --- and added a pair-score cache, a fully
-vectorized prefix scan, and run-based column counts. The third build (opt3) moves the
-all-pairs local-alignment stage to the M1 GPU with an integer Metal kernel that reproduces
-MAFFT's recurrence, tie rules and traceback exactly. The fourth (opt4) compiles that shader
-at build time and retunes it for GPU occupancy. On a production phylogenetics workload of
-fungal ITS alignments, opt4 runs L-INS-i 6.5$\times$ faster than stock MAFFT 7.526 in a
-single run (7.2$\times$ less CPU) and 4.6$\times$ faster at the production setting of 8
-concurrent alignments.
+We describe a series of builds of the multiple sequence aligner MAFFT 7.526 that run faster
+while producing output \emph{byte-identical} to unmodified MAFFT, so that downstream analyses
+calibrated on stock output are unaffected. The first four builds targeted an Apple M1. They
+found that much of the run time of the accurate L-INS-i mode went not to the
+dynamic-programming (DP) recurrences but to bookkeeping, added a pair-score cache for
+iterative refinement, and moved the all-pairs local-alignment stage to the GPU with an integer
+Metal kernel that reproduces MAFFT's recurrence, tie rules and traceback exactly. The fifth
+ported the vector kernels to AVX-512 and exposed that \emph{stock MAFFT itself} does not give
+the same alignments on every platform: a gcc build on x86 disagrees with the Mac on a third of
+inputs, because Apple's clang fuses multiply-adds and gcc does not, while a clang build with
+FMA on x86 reproduces the Mac's alignments. ``Identical to stock'' must therefore name the
+stock build's rounding class.
 
-The fifth build (opt5) ports the vector kernels to AVX-512 for AWS instances and leaves the
-arm64 machine code unchanged. On c7i and c7a instances it runs L-INS-i 5.7--7.0$\times$
-faster than stock in a single run and 5.1--5.9$\times$ faster at four concurrent alignments,
-and a c7a.xlarge aligns about 820 production shards per hour. Porting
-exposed a fact that matters more than the speed: \emph{stock MAFFT itself} does not give the
-same alignments on every platform. A gcc build on x86 disagrees with the Mac on 33\% of
-inputs, because Apple's clang fuses multiply-adds into a single rounding and gcc does not.
-A clang build with FMA on x86 reproduces the Mac's alignments on all 181 inputs tested, on
-Intel and AMD alike; it became the reference for the production deployment, with opt5
-verified against it. Every output of every build in every test was byte-identical to its
-stock reference, across all tested strategies and more than 5{,}000 production alignments
-checked end to end. The one discrepancy the rewrite introduced, a rounding difference, was
-caught by independent validation and fixed.
+A collaborator's build for an AVX2 server without AVX-512 (dikarya1) contributed an integer
+local-alignment fill that stores markers in place of gap offsets and recovers them during
+traceback. It was faster on AVX-512 too (opt6), and prompted a broader exploration. For opt7,
+three AI agents worked in parallel, one per architecture (AWS Graviton, AMD Zen~5 and Intel
+Granite Rapids, and an NVIDIA GPU), from the same tree and under the same exactness contract.
+Without communicating, they arrived at several of the same techniques, each written for its own
+platform. opt8 consolidated their work into one tree in which most code is portable and shared,
+and carrying each workstream's techniques to the other platforms made every machine we measured
+faster than opt7: 1.35$\times$ on AMD Zen~4 and Intel Sapphire Rapids with unchanged build
+flags, 1.24$\times$ for the AVX2 server's build class, 1.22$\times$ on the M1 and 1.05$\times$ on
+Graviton4. On production fungal ITS alignments, L-INS-i now runs 8.1$\times$ faster than stock in
+a single run on the M1, 7.5--9.8$\times$ faster at four concurrent alignments on recent AWS x86
+instances, about 5$\times$ on Graviton, and 5.9$\times$ on an AVX2-only host. A CUDA port of the
+GPU stage adds 1.24$\times$ but does not pay on AWS. Every output of every build in every test
+was byte-identical to its stock reference; the one discrepancy the work introduced, a rounding
+difference in opt1, was caught by independent validation and fixed.
 \end{abstract}
 
 \section{Introduction}
@@ -73,7 +74,7 @@ trimAl~\cite{capella2009} trimming, found that MAFFT FFT-NS-1 (135$\times$ faste
 69.7\%. We therefore set a stricter goal: make L-INS-i faster \emph{without changing a single
 output byte}. Such a speedup costs nothing in accuracy and needs no revalidation downstream.
 
-The work proceeded in five builds, each installed only after verification
+The work proceeded in a series of builds, each verified before use
 (Table~\ref{tab:builds}). Each reports a version string of the form \code{7.526-opt}$N$ so
 that downstream caches and provenance records can tell them apart
 (Section~\ref{sec:provenance}).
@@ -86,9 +87,17 @@ gives different alignments from stock MAFFT on the Mac for a third of the inputs
 build that fuses multiply-adds the way Apple's compiler does agrees with it
 (Section~\ref{sec:xplat}).
 
+After the series was published, a collaborator's build for an AVX2-only server (dikarya1,
+Section~\ref{sec:dikarya}) contributed a new local-alignment fill that also made our own x86
+build faster (opt6). That prompted a broader experiment: three AI agents, one per architecture,
+optimizing in parallel under the same contract (opt7, Section~\ref{sec:opt7}), followed by a
+consolidation of their work into one shared, mostly portable tree (opt8,
+Section~\ref{sec:opt8}). The agents arrived independently at several of the same techniques, and
+sharing them across platforms made every platform faster.
+
 \begin{table}[h]
 \centering
-\caption{The five builds, as commits on top of upstream MAFFT 7.526.}
+\caption{The builds, as commits on top of upstream MAFFT 7.526 (sizes are \code{core/} only).}
 \label{tab:builds}
 \begin{tabularx}{\linewidth}{llX}
 \toprule
@@ -99,6 +108,10 @@ opt2 & 5 files, +380/$-$96 & Refinement pair-score cache, vector prefix scan, ru
 opt3 & 4 files, +554/$-$10 & All-pairs local alignment on the GPU with Metal (Section~\ref{sec:gpu}) \\
 opt4 & 4 files, +230/$-$146 & Shader compiled at build time; occupancy-tuned kernel (Section~\ref{sec:opt4}) \\
 opt5 & 7 files, +505/$-$29 & AVX-512 kernels for x86; multiply-add rounding matched to each platform's stock build (Section~\ref{sec:opt5}) \\
+dikarya1 & 11 files, +659/$-$18 & AVX2 paths for x86 without AVX-512: marker fill, sparse profile scores, uncleared work rows (Section~\ref{sec:dikarya}) \\
+opt6 & 1 line & dikarya1's marker fill on AVX-512 builds (Section~\ref{sec:dikarya}) \\
+opt7 & 11 files, +2513/$-$38 & Linux arm64, newer x86 AVX-512 and CUDA, from three parallel workstreams (Section~\ref{sec:opt7}) \\
+opt8 & 12 files, +574/$-$1383 & Consolidation into shared, portable code (Section~\ref{sec:opt8}) \\
 \bottomrule
 \end{tabularx}
 \end{table}
@@ -116,6 +129,12 @@ first as a c7i.xlarge (Intel Xeon Platinum 8488C, Sapphire Rapids: 2 cores with 
 each, AVX-512, 105\,MB L3) and later, on the same disk, as a c7a.xlarge (AMD EPYC 9R14,
 Zen~4: 4 cores without SMT, AVX-512, 16\,MB L3). Compilers: gcc 11.5 and clang 15.0.7 from the
 distribution. Stock references were built on the instance from the upstream v7.526 tag.
+
+\paragraph{More architectures.} From dikarya1 on: the Dikarya host (Section~\ref{sec:dikarya});
+and on AWS, all xlarge (4 vCPUs) with Amazon Linux 2023, clang 15 and gcc 11: c8a (AMD EPYC,
+Zen~5), c8i (Intel Xeon, Granite Rapids), c8g (Graviton4, Neoverse V2, 128-bit SVE2), c7g
+(Graviton3, Neoverse V1, 256-bit SVE), g6 (NVIDIA L4; host AMD EPYC 7R13, Zen~3, AVX2 without
+AVX-512) and g4dn (NVIDIA T4; host Intel Cascade Lake), plus the c7a and c7i of opt5.
 
 \paragraph{Workloads.}
 (i)~Production ITS alignments: about 180 sequences of 500--1200\,bp with ragged,
@@ -475,8 +494,8 @@ with segments bucketed by band to avoid revisiting them. Software prefetching a 
 ahead in each segment did not help either (58.7--60.0\,G cycles per shard without it,
 60.5--62.2\,G with it). The c7i's 105\,MB
 L3 holds the whole 32\,MB matrix, and the out-of-order core already overlaps the misses.
-Both were dropped. The c7a's L3 is only 16\,MB, so banding may still pay there; it was not
-retried.
+Both were dropped here. Banding later paid on Graviton, whose L2 holds a band, and opt8 uses
+it on every platform (Sections~\ref{sec:opt7} and~\ref{sec:opt8}).
 
 \paragraph{Verification.} Each rewritten function got a per-call harness in the style of
 Section~\ref{sec:verify}: a patch that runs the vector and the scalar path on the same
@@ -582,6 +601,370 @@ indices of 0.983--0.997, and 95.5\% of groups were unchanged, about a sixth of t
 caused by re-sampling its input cover. It now shares alignments between the Mac and AWS and
 computes trees per platform; trees cost about a second each against 20--100\,s for the alignment.
 
+\section{dikarya1 and opt6: a server without AVX-512}
+\label{sec:dikarya}
+
+The opt5 kernels need AVX-512. On x86 CPUs without it, which include every Intel server part
+before Skylake-SP and many cloud and desktop machines today, opt5 falls back to its SSE4.1
+and scalar paths and leaves most of the run time where it was. After the fork was published,
+Alan Rockefeller extended it for Dikarya (\url{https://dikarya.us}), a phylogenetics web
+service for fungal ITS barcodes that runs MAFFT's \code{-{}-auto} mode (mostly L-INS-i-style
+local pairs, sometimes FFT-NS-i). The service runs on an Intel Xeon E5-2690 v4 (Broadwell-EP;
+two vCPUs of a virtual machine, AVX2 and FMA, no AVX-512), built with gcc 13.3 and
+\code{-march=native}; we call it the Dikarya host. The work, tagged \code{v7.526-opt5-dikarya1}
+(``dikarya1''), was designed, implemented, verified and benchmarked by Claude Code (Claude
+Opus 5.5), with Alan Rockefeller directing it, under the same exactness rule as the rest of
+the series. gcc never contracts multiply-adds in this build (Section~\ref{sec:xplat}), so
+every vector multiply-add below is a separate multiply and add.
+
+\paragraph{1. The marker fill.} In \code{L\_\_align11} (opt2, Section~\ref{sec:round2}) the
+traceback of a cell whose best move is a gap records where that gap started: the first
+position of a running maximum, which is what the prefix scans compute. A straight AVX2 port of
+those scans ran only 1.17$\times$ faster than SSE4.1: the loop is bound by vector operations
+per cell, not by width. dikarya1 removes the scans instead. A cell whose best move is a gap
+stores a marker in place of the offset; every DP row is kept rather than two alternating
+ones; and \code{Ltracking}, which reads the traceback only along its one path, recomputes the
+offset for each marked cell it meets by replaying the original scalar rule over the stored
+rows. The arithmetic is integer, so the recovered offsets are exactly those the full fill
+would have stored, under every rounding class. On the Broadwell this took the fill from 1.68
+to 0.82\,ns per cell, in a stage that is about 60\% of L-INS-i there. Computing offsets only
+for blocks that needed them was slower (on related ITS sequences gaps win across large
+areas, and the branch mispredicts).
+
+\paragraph{2. Sparse profile scores.} Every \code{match\_calc} starts with a 26$\times$26
+loop, \code{scarr[l] += mtx[j][l] * cpmx1[j][i1]}, which gcc compiled to gathers and a serial
+add chain. The new \code{scarr\_fill} skips letters absent from the column and handles four
+letters at a time, each lane with the original multiply-then-add sequence in the original
+order. Skipping is exact: the sum starts at $+0$, a sum of nonzero terms under
+round-to-nearest is never $-0$, so adding a zero term of either sign never changes it. This
+is most of \code{A\_\_align}, and so of FFT-NS-i.
+
+\paragraph{3. Uncleared work rows.} \code{Falign} allocated eight character matrices per call
+with \code{calloc}, clearing about 6\,MB per call. They are only used as strings written
+before they are read, so they are now allocated without clearing; a build option fills them
+with junk instead (\code{MAFFT\_POISON\_TEST}) to check that claim. This was about a quarter of
+an FFT-NS-i run. dikarya1 also added AVX2 versions of opt5's profile-DP row fills and of the
+search for a row maximum's first cell (small effects).
+
+\begin{table}[h]
+\centering
+\caption{dikarya1 on the Dikarya host: 14 inputs from the service (49--444 ITS/LSU
+sequences), \code{-{}-adjustdirection -{}-auto}; single runs, seconds (Alan Rockefeller's
+measurements).}
+\label{tab:dikarya}
+\begin{tabular}{lrrrrr}
+\toprule
+& Stock & opt5 & dikarya1 & vs.\ stock & vs.\ opt5 \\
+\midrule
+\code{-{}-auto} chose local pairs (10 inputs) & 361 & 97 & 56 & 6.4$\times$ & 1.7$\times$ \\
+\code{-{}-auto} chose FFT-NS-i (4 inputs) & 242 & 207 & 107 & 2.3$\times$ & 1.9$\times$ \\
+full L-INS-i, 176 sequences & 93.2 & 23.9 & 13.9 & 6.7$\times$ & 1.7$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Its outputs were byte-identical to stock (Ubuntu's 7.505 package and a gcc build of 7.526)
+on 52 real inputs, as built and with the poison option, and a comparison script ran six
+option sets (\code{-{}-auto}, L-INS-i, G-INS-i, FFT-NS-i, FFT-NS-2, \code{-{}-adjustdirection})
+against stock. We repeated the check on an AWS c7a: the gcc AVX2 build matched stock gcc on
+all 183 test shards and was 1.31$\times$ faster than opt5 built the same way.
+
+\paragraph{opt6.} The marker fill is integer-only, so nothing ties it to AVX2 or to the gcc
+rounding class. Enabled on the AVX-512 production build by a one-line change to its compile
+guard, it beat opt5's 16-lane prefix-scan fill. Over three interleaved rounds of 16 production
+shards at four concurrent, the batch went from 74.3 to 70.3\,s on the c7a and from 121.3 to
+115.7\,s on the c7i, and two single runs from 32.0 to 29.2\,s and from 33.6 to 32.4\,s. A
+16-lane version of the marker fill was no faster on either machine and was not adopted. A
+per-call harness ran every call of the marker fill with its vector loops on and off and
+compared the traceback, end point and every stored row (732{,}696 calls and
+$2.8\times10^{11}$ cells per build, in three builds), and opt6 matched the clang+FMA reference
+on all 183 shards on both instance types. Builds without AVX-512 compiled exactly dikarya1's
+objects.
+
+A collaborator's work for different hardware had made our own production build faster. That
+prompted the next step: rather than port to one machine at a time, explore several
+architectures at once.
+
+\section{opt7: three architectures in parallel}
+\label{sec:opt7}
+
+\paragraph{Targets.} We chose AWS instance types that differ in ways likely to call for
+different optimizations: Graviton4 (c8g, 128-bit SVE2) and Graviton3 (c7g, 256-bit SVE) for
+Linux arm64; AMD Zen~5 (c8a) and Intel Granite Rapids (c8i, with AMX) for newer AVX-512 with
+the VPOPCNTDQ and VBMI2 extensions; and an NVIDIA L4 (g6, with an AMD Zen~3 host) for a GPU
+port. x86 without AVX-512 was left out, since dikarya1 covered it.
+
+\paragraph{Method.} Each target got its own Claude Code agent (Claude Opus 5.5), working in the
+background on its own git worktree and branch from opt6 and on its own instances. All three
+received the same brief: the exactness contract; a per-call harness for every rewritten
+function; the 183-shard test set and the canary as end-to-end checks; proof that every other
+target compiles the same object files as before, using a script that compiles every source
+file of two trees with the same flags and compares the objects; the interleaved timing method
+of Section~\ref{sec:results}; no version or documentation changes; and test data kept on the
+instances. The agents did not communicate with one another. They did start from shared
+material: the same opt6 tree, the report, and an x86 profile in the brief. Some ideas were
+seeded by their prompts: the arm64 agent was pointed at the marker fill as a candidate for NEON
+or SVE, and the x86 agent was asked to retest the 16-lane marker fill, to try banding the
+importance matrix on a smaller L3, and to evaluate AMX. A coordinating Claude Code session
+chose the targets with the agent that owns the AWS account, merged the branches and ran the
+final verification. The x86 agent reported after 4.1 hours and the arm64 agent after 7.4.
+
+\subsection{Linux arm64}
+
+The rounding classes carry over from x86 (Section~\ref{sec:xplat}): stock 7.526 built with
+clang on Graviton reproduced the Mac's alignments on all 183 shards, while stock gcc matched
+them on only 122 of 181 inputs, the same count as gcc on x86. Linux arm64 builds with clang can
+therefore share the Mac's alignment cache. Without a GPU, opt6 on a c8g spent 48\% of its
+samples in the all-pairs fill (opt2's NEON prefix-scan kernel), 12\% in \code{fillimp}, 10\% in
+\code{partA\_\_align} and 6.5\% in \code{match\_calc}.
+
+\begin{itemize}
+\item The marker fill in NEON, and a vector-length-agnostic SVE loop chosen at run time only
+  when vectors are at least 256 bits wide (Graviton3; on Graviton4's 128-bit SVE2 the NEON loop
+  was 12\% faster). The all-pairs stage alone went from 11.0 to 6.7\,s on the c8g.
+\item The end cell found once: when a row's maximum beats the best so far, the original
+  searches that row for the first cell holding it. Once the best exceeds the local threshold,
+  that cell is the first $j$ whose stored value minus its substitution score equals the row
+  maximum, so the search is needed only for the row that finally sets the best, and is done
+  once, after the last row, from the kept rows. All-pairs stage 9.5--12\% faster.
+\item \code{fillimp} in bands of 128 importance-matrix rows (Section~\ref{sec:round1}, item~1),
+  visiting each band's segments in their original order, so every cell receives the same
+  additions in the same order; Graviton's 1--2\,MB L2 holds a band, not the 32\,MB matrix. 5\%
+  of a run on the c7g, 1\% on the c8g. The matrix itself in transparent huge pages ($-$2\%).
+\item Exact integer pair-score sums by NEON table lookup, 16 columns at a time, replacing the
+  scalar loop that stood in for Accelerate's GEMM.
+\item NEON versions of opt5's byte-mask passes (16 bytes at a time) and of the grouped profile
+  scores in \code{mc\_match}; gap runs added as whole vectors in the column profiles of
+  \code{cpmx\_calc\_new} and \code{alignableReagion} (about 70\% of columns are gaps; $-$5\%).
+\item opt1's NEON row fills, until then compiled only where stock fuses multiply-adds, also for
+  gcc builds, with a separate multiply and add.
+\end{itemize}
+
+A NEON prefix scan in the profile-DP rows was slower than the scalar scan, whose branch
+predicts well, and was dropped.
+
+\subsection{Newer x86 with AVX-512}
+
+On Zen~5 the DP loops ran at about 2.7 instructions per cycle, so cutting instructions paid and
+cutting memory traffic mostly did not. The profile of opt6 on the c8a was spread out: the
+all-pairs fill 21\%, \code{fillimp} 19\%, \code{partA\_\_align} 17\% (a third of it the
+importance-matrix gather), \code{match\_calc} 10\%, pair scores 8\%.
+
+\begin{itemize}
+\item A striped integer fill (Farrar's layout~\cite{farrar2007}): the horizontal-gap state is a
+  running maximum along each lane plus a carry from the previous row's pass, so the loop has no
+  prefix scan at all. The traceback is one byte per cell, and its gap offsets are recovered
+  with opt6's marker replay. The fill went from 24.2K to 18.0K samples.
+\item The importance-matrix gather reads only the columns each row actually wrote; every other
+  cell is $+0.0$, and adding it is done without fetching it ($-$43\% of \code{partA}'s
+  samples). The matrix is one 2\,MB-aligned block marked for huge pages, and \code{fillimp}
+  walks it from one base pointer; with residue maps built 64 columns at a time, \code{fillimp}
+  fell by 21\%.
+\item \code{match\_calc} in blocks of eight columns with masked multiply-adds, each column
+  keeping its own chain and order ($-$34\%).
+\item Pair scores from per-letter bit masks and popcount, which are exact integer sums ($-$68\%);
+  traceback rows assembled with VBMI2 byte expansion; the column profiles 64 columns at a time
+  with masked adds; a shorter loop-carried chain in the profile-DP prefix scan ($-$20\% of
+  \code{partA}).
+\end{itemize}
+
+Tried and dropped: the 16-lane marker fill (6\% faster on Zen~5, superseded by the striped
+fill); fills that store flag bits or bytes per cell instead of the traceback (10--25\% slower);
+tracking the row maximum inside the fill loop (its compare-and-move chain cost 11\% of the
+stage); a gather/scatter \code{fillimp} walk (60\% slower); banding \code{fillimp} (not
+implemented: each update costs about three cycles and the out-of-order core overlaps the
+misses); and AMX, because the only matrix-shaped work, about 3\% of the run, had become exact
+popcount sums. All of this was gated behind both extensions, so the production
+\code{-march=x86-64-v4} build compiled exactly opt6's objects.
+
+\subsection{NVIDIA GPU}
+
+\code{core/l11gpu.cu} is a CUDA version of the Metal all-pairs kernel of opt3
+(Section~\ref{sec:gpu}): the same integer recurrence, comparisons, tie rules and traceback, so
+the result does not depend on the GPU. Each warp aligns one pair, each lane holding a strip of
+columns in registers; the horizontal-gap state comes from a warp-wide prefix-maximum scan
+with shuffles, row maxima from warp reductions, and the traceback is walked on the GPU. Pairs
+outside the Mac's limits, a missing GPU or driver, or any CUDA error fall back to the CPU, and
+\code{MAFFT\_NOGPU=1} disables it. Every GPU result compared with the CPU routine: 733{,}956
+pairs and $2.8\times10^{11}$ cells, 0 mismatches. The same agent also enabled dikarya1's AVX2
+paths in the clang+FMA class, with fused vector multiply-adds there, so that clang builds on
+AVX2-only hosts such as the GPU instance's use them too.
+
+This agent queued a 90-minute timing session on an instance with a fixed eight-hour lifetime,
+ended its turn waiting for it, and never copied the results back; the instance expired with
+them. We repeated the timing on a borrowed T4 instance (g4dn: Intel Cascade Lake host, two
+cores with two threads each) with a script that copied results back after every step. There
+16 shards at four concurrent took 895\,s with stock, 182\,s with opt7 on the CPU and 154\,s with
+the GPU: the GPU added 1.2$\times$. Section~\ref{sec:results} gives the L4 numbers measured with
+opt8. Neither pays on AWS: GPU instances pair the GPU with few CPU cores, refinement stays on
+the CPU, and the cost per alignment was more than ten times that of a CPU-only c8a.
+
+\subsection{Merging}
+
+The coordinating session merged the x86 branch, then arm64, then CUDA. The two CPU branches
+conflicted where both had replaced the importance-matrix allocator with a huge-page block; each
+platform kept its own version. After the first merge, the merged tree compiled the same objects
+as each branch for that branch's targets (0 of 65 object files differed, for every x86 and arm64
+configuration), so the agents' per-call verification carried over unchanged. The CUDA
+workstream's new AVX2 byte-mask passes would have changed the objects of the gcc AVX2 build that
+dikarya1 had verified on its own hardware; they were made opt-in in that class. The merged tree
+matched the Mac reference on all 183 shards on the c8a, c8i, c8g, c7g and the T4 host, passed the
+canary on each, and matched stock gcc on a 43-shard subset in the gcc class.
+
+\begin{table}[h]
+\centering
+\caption{opt7 against stock and opt6 on the workstreams' own machines, clang (clang+FMA on x86):
+16 shards at four concurrent (wall) and two shards run singly; means of three interleaved
+rounds. x86 uses \code{-march=x86-64-v4 -mavx512vpopcntdq -mavx512vbmi2}.}
+\label{tab:opt7}
+\begin{tabular}{lrrrrr}
+\toprule
+& \multicolumn{3}{c}{16 shards, 4 concurrent} & \multicolumn{2}{c}{opt7 speedup} \\
+\cmidrule(lr){2-4}\cmidrule(lr){5-6}
+Machine & Stock & opt6 & opt7 & vs.\ stock & single runs \\
+\midrule
+c8a (AMD Zen 5) & 283.7\,s & 46.0\,s & 29.0\,s & 9.8$\times$ & 12.2$\times$ \\
+c8i (Intel Granite Rapids) & 494.7\,s & 86.0\,s & 60.7\,s & 8.2$\times$ & 9.3$\times$ \\
+c8g (Graviton4) & 377.3\,s & 105.7\,s & 79.3\,s & 4.8$\times$ & 5.4$\times$ \\
+c7g (Graviton3) & 474.0\,s & 131.0\,s & 92.3\,s & 5.1$\times$ & 5.6$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{What the agents found independently}
+\label{sec:convergence}
+
+With the same starting tree, the same exactness rule and the same kind of workload, the three
+agents found the same hot spots and, several times, the same kind of exact transformation for
+them, each written for its own instruction set (Table~\ref{tab:convergence}). The shared
+profile pointed all three at the same functions, and four ideas were suggested in the prompts
+(the marker fill to arm64; the 16-lane fill, banding and AMX to x86); the table lists only
+techniques no prompt named.
+
+\begin{table}[h]
+\centering\small
+\caption{Techniques two or more opt7 workstreams arrived at independently, and how opt8 combined them.}
+\label{tab:convergence}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{3.3cm}>{\raggedright\arraybackslash}p{1.5cm}X>{\raggedright\arraybackslash}p{3.5cm}}
+\toprule
+Technique & Work\-streams & Their versions & In opt8 \\
+\midrule
+Importance matrix as one huge-page block & x86, arm64 & 2\,MB-aligned block (x86); transparent huge pages via \code{madvise} (arm64). The one merge conflict. & One allocator on every platform \\
+\code{fillimp} walk rewritten for locality & x86, arm64 & One base pointer over the contiguous matrix (x86); 128-row bands sized to L2 (arm64) & Both, on every platform \\
+Importance-matrix gather & x86, arm64 & Only the columns each row wrote (x86); vector loads over contiguous column runs (arm64) & Written-range gather everywhere, with per-ISA inner loops \\
+Byte-mask passes (gap runs, character presence, residue maps) & all three & opt5's 64-byte AVX-512 passes re-written at 32 bytes (AVX2), 16 bytes (NEON), and with masked 64-column adds (newer AVX-512) & One loop over a byte-compare primitive \\
+Column profiles bin-major with vector adds & x86, arm64 & One masked add per character (x86); whole-vector adds for gap runs (arm64) & Bin-major everywhere; per-character adds only on AVX-512 \\
+Exact integer pair-score sums without Accelerate & x86, arm64 & Bit masks and popcount (x86); table lookup (arm64) & Popcount wherever available; arm64 keeps its table \\
+Vector code extended to the other rounding class & CUDA, arm64 & gcc-only AVX2 rows enabled for clang+FMA (CUDA); fused-only NEON rows enabled for gcc (arm64) & One set of multiply-add macros \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+The end-cell search is a partial case: the x86 agent moved the row maximum's first-cell search
+out of its fill loop, while the arm64 agent went further and searched once per pair. The arm64
+agent's report recommended passing that idea and its gap-run adds to the x86 workstream.
+
+Convergence also had a cost. Each agent locked its version behind guards for its own target,
+so the merged tree was, in the words of a review of it, ``partly a union'': six near-copies of
+the byte-mask loop, four exact algorithms for one pair-score sum, two allocators, three copies of
+the sparse profile scores, and about 37 distinct spellings of the feature tests, many naming
+the compiler's target macros directly. Several portable ideas ran on one platform only: the
+end-cell search and banding only on Linux arm64, the written-range gather and the base-pointer
+walk only with the new x86 extensions, and the sparse profile scores nowhere on the AVX-512
+production build or on Apple silicon. And most of the x86 kernels needed neither VPOPCNTDQ nor
+VBMI2, so the production c7a and c7i builds, and the AVX2 hosts, missed them for no reason.
+
+\section{opt8: consolidation}
+\label{sec:opt8}
+
+A review agent read the merged tree in six minutes and listed the duplication above. The
+coordinating session then consolidated the tree itself, since the work cut across all three
+workstreams, under four rules: decide the feature tests in one place; write each algorithm once
+in portable C, with small instruction-set primitives where they pay; guard code by the
+instructions it actually uses; and measure each platform before sharing a technique with it,
+keeping a platform-specific version where it is faster. The first consolidated tree took
+about 40 minutes to write; verifying and tuning it on AWS took most of a day.
+
+\begin{itemize}
+\item \textbf{One header.} \code{core/mafft\_simd.h} defines what a build compiles: AArch64,
+  SVE, SSE4.1, AVX2, AVX-512 (F, BW and VL), AVX-512 with VBMI2, and whether the stock build of
+  the target fuses multiply-adds; with that, the multiply-add macros of every vector width. Lines
+  testing the compiler's own target macros fell from 72 to 11, and feature-test lines overall
+  from 149 to 108.
+\item \textbf{Portable algorithms.} The sparse profile scores, the importance-matrix allocator,
+  the banded base-pointer \code{fillimp} walk, the written-range gather, run-wise column
+  compaction (from opt5's x86 code) and the marker fills' end-cell search each exist once, and every build
+  runs them. The marker fill now also serves Apple silicon's CPU path.
+\item \textbf{Byte-mask primitives.} \code{gapruns}, \code{makeresmap}, \code{cpmx\_calc\_new}
+  and \code{alignableReagion} share one loop over a mask of byte comparisons (64 bytes at a time
+  on AVX-512, 32 on AVX2, 16 on NEON with one bit per nibble), with a scalar tail; a block of
+  gaps is one vector add on every instruction set.
+\item \textbf{The x86 kernels on every AVX-512 build.} Only one site needs VBMI2 (the traceback
+  expansion, which has a scalar version), and none needs VPOPCNTDQ, so plain
+  \code{-march=x86-64-v4} now compiles the striped fill, the eight-column \code{match\_calc} and
+  the popcount pair scores.
+\item \textbf{Removed:} opt5's AVX-512 and AVX2 prefix-scan fills, unreachable since opt6; the
+  duplicate allocators, row loops and traceback; and the opt-in flag for the AVX2 passes.
+  \code{core/} changed by $+$574/$-$1{,}383 lines.
+\end{itemize}
+
+Two measurements kept platform-specific code. On Graviton4 the first consolidated tree was
+4\% slower than opt7: one mask per character on 16-byte NEON blocks doubled the share of the
+two profile functions, and the portable popcount pair scores were about 2\% slower than arm64's
+table lookup. Per-character adds are now used only on AVX-512, mixed blocks elsewhere go
+element by element after the gap-block fast path, and Linux arm64 keeps its table. Compiler
+warnings caught two real bugs while code moved into shared paths: two call sites added in
+dikarya1 passed an integer matrix to the new \code{scarr\_fill}, which takes doubles (both
+unreachable from the strategies MAFFT runs, so no output had been affected), and the
+consolidation's own new shared set-up function cleared 8 bytes instead of 256 (caught before
+anything ran).
+
+Because opt8 changed the objects of the gcc AVX2 build that dikarya1 had verified on its own
+hardware, we checked it in that build class on the g6 instance's AMD Zen~3 host (AVX2, no
+AVX-512) with gcc \code{-march=broadwell}: all 183 shards gave alignments identical to dikarya1
+built the same way, the 13 canary windows matched stock gcc, and 16 FFT-NS-i alignments matched
+dikarya1. There, dikarya1's ratios to stock (5.8$\times$ for single L-INS-i runs, 2.1$\times$ for
+FFT-NS-i) were close to those measured on the Dikarya host (6.7$\times$ and 2.3$\times$), so it is a
+reasonable stand-in, though opt8 has not yet been timed on the Dikarya host itself.
+
+\begin{table}[h]
+\centering
+\caption{opt8 against opt7, interleaved in the same session: 16 shards at four concurrent,
+wall (CPU), and two shards run singly. On the M1, six shards run singly, each once per build
+in two interleaved rounds.}
+\label{tab:opt8}
+\begin{tabular}{lrrr}
+\toprule
+Machine and build & opt7 & opt8 & Speedup \\
+\midrule
+c7a (Zen 4), clang+FMA \code{-march=x86-64-v4} & 65.0\,s (246) & 48.0\,s (180) & 1.35$\times$ \\
+\quad singles & 26.9\,s & 19.8\,s & 1.36$\times$ \\
+c7i (Sapphire Rapids), same flags & 107.7\,s (415) & 79.7\,s (303) & 1.35$\times$ \\
+\quad singles & 30.6\,s & 22.5\,s & 1.36$\times$ \\
+c7a, adding VPOPCNTDQ and VBMI2 & 46.3\,s (171) & 47.0\,s (174) & 0.98$\times$ \\
+c7i, adding VPOPCNTDQ and VBMI2 & 76.7\,s (293) & 76.7\,s (293) & 1.00$\times$ \\
+c8g (Graviton4), clang \code{-mcpu=neoverse-v1} & 80\,s (302) & 76\,s (288) & 1.05$\times$ \\
+Zen 3, AVX2 only, gcc \code{-march=broadwell}$^\dagger$ & 135.5\,s (512) & 109.5\,s (415) & 1.24$\times$ \\
+\quad singles & 36.9\,s & 30.1\,s & 1.22$\times$ \\
+\quad FFT-NS-i, 16 shards & 35\,s & 28.5\,s & 1.23$\times$ \\
+Apple M1, six shards singly & 162\,s & 132\,s & 1.22$\times$ \\
+\bottomrule
+\multicolumn{4}{l}{\footnotesize $^\dagger$The Dikarya host's build class; opt7 compiles dikarya1's objects there.}
+\end{tabular}
+\end{table}
+
+opt8 was faster than opt7 on every machine at its production flags (Table~\ref{tab:opt8}). Since
+every build computes the same results, each gain can only come from code that platform did not
+run before. The c7a and c7i, which had kept
+opt6's objects in opt7, now run the x86 workstream's kernels without new flags. The Graviton gets
+the x86 workstream's written-range gather and base-pointer walk, and the shared byte-mask
+passes. The M1 gets the marker fill as
+its CPU fallback, arm64's banded walk and NEON passes, x86's gather, dikarya1's sparse profile
+scores and opt5's run-wise compaction. The AVX2 build gets the byte-mask passes, the banded walk
+and the gather. We did not measure which change accounts for how much on each machine. With the
+extra flags on Zen~4, opt7's separate kernels were up to 2\% faster than opt8's shared ones,
+which was accepted for the simpler tree.
+
 \section{Verification}
 \label{sec:verify}
 
@@ -620,6 +1003,23 @@ The same layers were applied to each later build:
   same instance on both the c7i and the c7a (Section~\ref{sec:xplat}); and the 12-case
   placement canary. The deployed container image rebuilt the binaries byte for byte (checked by MD5)
   and passed the canary of Section~\ref{sec:avail} on AWS Batch.
+\item \textbf{dikarya1 and opt6}: Section~\ref{sec:dikarya}; in addition, the gcc AVX2 build
+  matched stock gcc on all 183 shards on a c7a, and so did builds with the poison option on a
+  53-shard subset.
+\item \textbf{opt7}: each workstream wrote a per-call harness for every function it rewrote and
+  ran it across L-INS-i with three gap settings, the protein sample, other strategies and the
+  placement cases (on arm64, nine modes in both rounding classes, with the SVE and NEON fills
+  forced on the machine that would not choose them). Each also showed, by comparing object
+  files, that every other target compiled exactly what it had before, which is what let the
+  agents' verification carry over to the merged tree (Section~\ref{sec:opt7}).
+\item \textbf{opt8}: new harnesses for the shared byte-mask passes, the banded walk, the sparse
+  profile scores and the striped fill's traceback, plus the marker-fill, pair-score and GPU
+  harnesses that still applied; then all 183 shards against the Mac reference on the c7a (two
+  flag sets), c8g and the L4 instance with CUDA; the canary on every machine, including the M1
+  with and without the GPU; and in the Dikarya host's build class all 183 shards against dikarya1
+  (Section~\ref{sec:opt8}). The test trees were built from \code{git archive}, after a copy of a
+  working tree with stale objects had once produced a harness binary that silently was not the
+  code under test.
 \end{itemize}
 
 Across the project the pipeline recorded 100/100 production shards and 200/200 pre-release
@@ -773,6 +1173,12 @@ every build is byte-identical, choosing among them is purely a performance quest
 At production concurrency a region of 2{,}415 shards now takes about 2.6 hours rather than
 the roughly 12 it takes with stock MAFFT at the same concurrency.
 
+opt8 brought the M1 code that the other platforms had developed (Section~\ref{sec:opt8}). Six
+shards run singly, each once per build in two interleaved rounds, took 1{,}059.6\,s with Homebrew's
+stock 7.526 and 131.5\,s with opt8: 8.1$\times$ in wall time and 9.2$\times$ in CPU time, with all 24
+outputs identical to the stored references. The 8-way figure in Table~\ref{tab:wall4} has not
+been remeasured with opt8.
+
 \subsection{x86}
 
 The x86 benchmarks used the same discipline as on the M1, with nothing else running on the
@@ -847,15 +1253,55 @@ and the batches used different production shards). Over all 183 test shards at f
 The deployment uses the c7a, with the c7i as a Spot fallback, since the two give identical
 output. For comparison, opt4 on the M1 aligns about 930 shards per hour at 8 concurrent.
 
+\subsection{Across architectures}
+\label{sec:allarch}
+
+Table~\ref{tab:allarch} collects the current speedups over stock. The same 16 shards and two
+singles were used throughout, with batch order alternated and a sampler watching for outside
+load, as above. Where opt8 was not run on a machine, the table gives opt7.
+
+\begin{table}[h]
+\centering
+\caption{Speedup over stock 7.526 built the same way on the same machine, L-INS-i on production
+ITS shards, \code{-{}-thread 1} per run: 16 shards at four concurrent and two shards run singly
+(on the M1: six shards singly).}
+\label{tab:allarch}
+\begin{tabular}{llrr}
+\toprule
+Machine & Build & 16 shards, 4 concurrent & Single runs \\
+\midrule
+Apple M1, with the Metal GPU & opt8 & & 8.1$\times$ \\
+c7a (Zen 4), clang+FMA & opt8 & 8.6$\times$$^*$ & 10.5$\times$$^*$ \\
+c7i (Sapphire Rapids), clang+FMA & opt8 & 7.5$\times$$^*$ & 8.1$\times$$^*$ \\
+c8a (Zen 5), clang+FMA & opt7 & 9.8$\times$ & 12.2$\times$ \\
+c8i (Granite Rapids), clang+FMA & opt7 & 8.2$\times$ & 9.3$\times$ \\
+c8g (Graviton4), clang & opt8 & 5.0$\times$$^*$ & 5.6$\times$$^*$ \\
+c7g (Graviton3), clang & opt7 & 5.1$\times$ & 5.6$\times$ \\
+g6 (L4 + Zen 3 host), clang+FMA, CUDA & opt8 & 8.0$\times$$^\dagger$ & 9.6$\times$$^\dagger$ \\
+\quad the same without CUDA & opt8 & 6.5$\times$$^\dagger$ & 7.6$\times$$^\dagger$ \\
+Zen 3 host, AVX2 only, gcc & opt8 & 5.9$\times$ & 7.1$\times$ \\
+\quad FFT-NS-i (\code{-{}-maxiterate 1000}) & opt8 & 2.6$\times$ & \\
+\bottomrule
+\multicolumn{4}{l}{\footnotesize $^*$Stock timed on the same instance type in an earlier session (Table~\ref{tab:x86four}; Table~\ref{tab:opt7} for c8g).}\\
+\multicolumn{4}{l}{\footnotesize $^\dagger$Against stock built with gcc, which is 2--6\% slower than stock built with clang.}
+\end{tabular}
+\end{table}
+
+Cross-session ratios carry the drift noted above: the c7i ran up to 15\% slower in one session
+than another, while on the c8g opt7 timed in two sessions agreed within 1\%. On the L4 instance
+the GPU added 1.24$\times$ to opt8 and was idle in most five-second samples: the refinement, which
+stays on the CPU, dominates. At on-demand prices that is about \$1.10 per 1{,}000 shards, against
+about \$0.17 on a c7a with opt8 and \$0.11 on a c8a with opt7.
+
 \section{What did not work, and limitations}
 
 \begin{itemize}
 \item \textbf{Generality.} The speedups, not the exactness, are specific to this workload and
   hardware. Which optimizations paid depended on the shape of the alignments (about 180
   sequences, about 2{,}000 columns, 71\% gaps), on the default scoring settings, and on the
-  machine: banding the importance matrix did not help with a 105\,MB L3 but may with 16\,MB,
-  the GPU stage exists only on the Mac, and gains ranged from 5.1$\times$ to 5.8$\times$ across
-  our own shard sets at four concurrent. Other inputs or machines may see smaller gains. Every
+  machine: banding the importance matrix did not help with a 105\,MB L3 but did with Graviton's
+  small L2, a GPU pays on the M1 but not on AWS, and gains at four concurrent ranged from
+  about 5$\times$ on Graviton to nearly 10$\times$ on Zen~5. Other inputs or machines may see smaller gains. Every
   fast path checks its preconditions and falls back to the original code, so they will see
   the same output.
 \item \textbf{Blocked prefix scan.} Splitting the \code{L\_\_align11} row scan into four
@@ -875,15 +1321,26 @@ output. For comparison, opt4 on the M1 aligns about 930 shards per hour at 8 con
   code, and are exact but not faster.
 \item \textbf{Threads.} We did not make \code{-{}-thread N} deterministic. Stock MAFFT is
   already nondeterministic there, and the pipeline parallelizes across inputs instead.
-\item \textbf{Platforms.} NEON, Accelerate and Metal code is guarded by \code{\_\_ARM\_NEON}
-  and \code{\_\_APPLE\_\_}, and the x86 kernels by \code{\_\_AVX512F\_\_} (with SSE4.1 versions of
-  the local-alignment fill). The AVX-512 build needs \code{-march=x86-64-v4}; without it the
-  portable C paths are used, which are exact but were not benchmarked. Graviton (arm64 Linux)
-  would take the NEON paths but was not tested; with gcc there, \code{MAFFT\_STOCK\_FMA} would be
-  off and the fused NEON row kernels disabled.
-\item \textbf{Importance matrix on x86.} Banding the importance-matrix fill and prefetching
-  within it did not help on Sapphire Rapids (Section~\ref{sec:opt5}); it remains the largest
-  single cost there, and banding was not tried on the c7a's smaller L3.
+\item \textbf{Platforms.} All feature tests are in \code{core/mafft\_simd.h}. Apple silicon,
+  Linux arm64 (Graviton3 and 4), x86-64 with AVX-512 (Zen~4 and~5, Sapphire Rapids, Granite
+  Rapids) and with AVX2 only (Zen~3, and the Broadwell Dikarya host for dikarya1), and NVIDIA L4
+  and T4 GPUs were verified. Other targets compile the same algorithms in scalar code, which is
+  exact by construction but was not benchmarked; opt8 has not yet been timed on the Dikarya host.
+\item \textbf{Ideas that did not pay} in opt7 and opt8: a 16-lane marker fill (no gain on Zen~4 or
+  Sapphire Rapids; 6\% on Zen~5, then superseded); fills storing flag bits instead of the
+  traceback; tracking the row maximum inside the fill loop; a gather/scatter importance-matrix
+  walk; AMX; a NEON prefix scan in the profile-DP rows; SVE on 128-bit vectors; and, on Graviton,
+  per-character byte masks and the portable popcount pair scores, which opt8 had to take back
+  (Section~\ref{sec:opt8}).
+\item \textbf{GPU on AWS.} The CUDA stage is exact and adds about 1.2$\times$, but on the GPU
+  instances available the refinement on few CPU cores dominates, and the cost per alignment was
+  more than ten times that of a CPU-only instance. Refinement was not moved to the GPU: it runs
+  step by step in double precision, which the L4 executes at about 1/64 of its single-precision
+  rate.
+\item \textbf{Parallel agents.} One agent let its results be lost by waiting on a job past its
+  instance's fixed lifetime, and the coordinating session did not check on it in time; later
+  runs copied results back after every step. Merged parallel work was a union rather than a
+  design until it was consolidated (Section~\ref{sec:convergence}).
 \item \textbf{Version strings.} The version string does not record the rounding class, so a gcc
   and a clang+FMA build of the same commit cannot be told apart by it
   (Section~\ref{sec:provenance}).
@@ -902,34 +1359,54 @@ output. For comparison, opt4 on the M1 aligns about 930 shards per hour at 8 con
 
 \section{Conclusions}
 
-Mature scientific code can hold large, exact speedups: here 6.5$\times$ on the M1 and
-5--7$\times$ on x86, mostly from bookkeeping and data layout rather than new algorithms, and
-without changing an output byte, so nothing downstream had to be revalidated. Porting showed
-that ``identical to stock'' must name the stock build, because the compiler's rounding of
-multiply-adds alone changed a third of the alignments between platforms.
+Mature scientific code can hold large, exact speedups: here 8.1$\times$ on the M1 and
+5--10$\times$ on AWS CPUs, mostly from bookkeeping and data layout rather than new algorithms,
+and without changing an output byte, so nothing downstream had to be revalidated. Porting
+showed that ``identical to stock'' must name the stock build, because the compiler's rounding
+of multiply-adds alone changed a third of the alignments between platforms.
+
+The later builds tried a way to extend this work across hardware. Three agents, each with its
+own machines and the same contract, produced verified speedups for three architectures in
+parallel, each within about seven hours. Working from the same tree and the same profile without
+communicating, they reached several of the same exact transformations, which suggests these are
+natural ones for this code rather than one agent's habits. Merged as written, however, their work
+was a union: the same ideas in per-platform copies, each run and tested only where it was born.
+Consolidating them into portable code with small per-platform primitives made the code smaller,
+put each technique under test on every platform, and made every platform we measured faster,
+since each gained what the others had found. It also needed measurement before sharing, as the Graviton
+regression showed. The parallel phase found the ideas; the consolidation spread them.
+
+The broadening began with a collaborator. Alan Rockefeller's dikarya1 work for Dikarya's AVX2
+server contributed the marker fill, which made our own x86 production build faster, and it
+prompted us to explore more architectures, which paid off on every platform we measured,
+including the M1 where the series began.
 
 This work was done by an AI coding agent, Claude Code running Claude Opus 5.5, with a
-researcher setting the direction and the acceptance rules. It took about a week of calendar
-time from the first build to the deployed x86 build, within a \$200/month subscription; by the
-authors' estimate the same work would have taken a human developer several weeks. The
-compute savings alone repay that slowly: at on-demand prices the x86 build saves about \$1.21
-per 1{,}000 shards (\$1.46 against \$0.25 on a c7a), so even charging the whole month to this
-work, it is recouped only after about 165{,}000 shards, roughly 70 regions, and after about
-twice as many at Spot prices. The immediate return is turnaround: a region that took about 12 hours
-to align on the M1 now takes about 2.6, which shortens the research loop.
+researcher setting the direction and the acceptance rules. The first five builds took about a
+week of calendar time, and dikarya1's evaluation through opt8 about a day and a half more,
+within a \$200/month subscription; by the authors' estimate the same work would have taken a
+human developer several weeks. AWS instances for opt7 and opt8 cost on the order of \$25 (our
+estimate; costs were not recorded per instance). The compute savings alone repay the
+subscription slowly: at on-demand prices opt8 on a c7a saves about \$1.29 per 1{,}000 shards
+(\$1.46 against \$0.17), so even charging a whole month to this work, it is recouped only after
+about 155{,}000 shards, roughly 65 regions. The immediate return is turnaround: a region that
+took about 12 hours to align on the M1 with stock MAFFT now takes about 2.6 hours with opt4,
+and less with opt8.
 
 What made the work safe to delegate was verification, not the agent. The exactness contract
 was fixed in advance, each rewritten function was checked against the original on every call,
-and a separate Claude Code session working on the pipeline, under its own user's approval,
-validated each Mac build on production data before it was installed; the x86 build was
-accepted against its reference on the instance types it runs on, and the deployed image
-re-runs a canary. The independent check caught the one error the rewrite introduced
+object-file comparison showed which targets a change could affect, so that verification
+carried over across merges and refactors, and a separate Claude Code session working on the
+pipeline, under its own user's approval, validated each Mac build on production data before it
+was installed. The independent check caught the one error the rewrite introduced
 (Section~\ref{sec:bug}).
 
 For compute-bound pipelines that run a fixed tool at scale, we therefore recommend profiling
 the dominant tool on the hardware it actually runs on and, where results must not change,
 attempting exact optimization under the same discipline: an explicit output contract,
 per-function bitwise checks, and validation by someone other than the author of the change.
+Where several platforms matter, parallel per-platform work is effective, provided it is
+followed by a deliberate consolidation.
 
 \section{Related work}
 
@@ -957,26 +1434,36 @@ output across architectures.
 The builds are a linear series of commits on top of upstream GitLab \code{main} (7.526,
 including December 2025 commits). They are published, with this report, as the
 \code{exact-speedups} branch of an unofficial fork,
-\url{https://github.com/joshuaowalker/mafft}, with one tag per build
-(\code{v7.526-opt1} to \code{v7.526-opt5}). In total they change 16 files
-(+2{,}638/$-$200 lines), all in \code{core/}. opt4 is installed for local projects on the Mac (opt5 is the same
-code there); the earlier builds are kept for rollback. On AWS, opt5 runs in a container image
-built from these sources: clang 15 with \code{-O3 -march=x86-64-v4 -DMAFFT\_STOCK\_FMA=1}, next
-to the clang+FMA stock reference, trimAl 1.5.1, and the bioconda FastTree binary, copied
-rather than rebuilt. The opt5 per-call harnesses are in the fork's \code{harness/opt5}
-directory as patch scripts. A self-contained
-canary checks a build in one command: L-INS-i on the 13 canary windows and the 12 placement
-cases against the Mac's stored outputs, plus the tree stage against x86 hashes. It passes on
-opt5-clang and on the Mac's opt4, and fails on exactly the five divergent windows when given
-the gcc build. The deployed image runs it on AWS Batch. The canary is built from the pipeline's data and is not published.
+\url{https://github.com/joshuaowalker/mafft}, with one tag per build (\code{v7.526-opt1} to
+\code{v7.526-opt8}, and \code{v7.526-opt5-dikarya1}). opt8 changes 23 files (+5{,}052/$-$302
+lines), all in \code{core/}; the feature tests are in \code{core/mafft\_simd.h}, and the fork's
+README gives the build flags for each platform. The per-call harnesses are in the fork's
+\code{harness/} directory as patch scripts, one directory per build that introduced them, with
+the object-file comparison script beside them. opt4 is installed for local projects on the Mac;
+on AWS, opt5 runs in a container image built from these sources (clang 15 with \code{-O3
+-march=x86-64-v4 -DMAFFT\_STOCK\_FMA=1}), next to the clang+FMA stock reference, trimAl 1.5.1,
+and the bioconda FastTree binary, copied rather than rebuilt. A self-contained canary checks a
+build in one command: L-INS-i on the 13 canary windows and the 12 placement cases against the
+Mac's stored outputs, plus the tree stage against x86 hashes. Its alignment checks pass on every
+build since opt4 on the M1 and on every AWS machine above, and it fails on exactly the five divergent windows when given a gcc
+build. The canary is built from the pipeline's data and is not published.
 
 Promising next steps are:
-(i)~the importance-matrix fill, now the largest cost on x86, by banding on machines whose L3
-cannot hold the matrix, such as the c7a;
-(ii)~recording the rounding class in the version string itself;
-(iii)~making the shader fallback observable, or optionally an error;
-(iv)~testing the longest ITS sequences the pipeline now aligns;
-and (v)~offering these changes to the MAFFT maintainers.
+(i)~timing opt8 on the Dikarya host itself;
+(ii)~moving the AWS deployment to opt8, which with the same flags is 1.35$\times$ faster than opt6
+and opt7 (and more than the deployed opt5), or to a c8a;
+(iii)~trying the striped fill at 8 and 4 lanes for AVX2 and NEON, and the end-cell search in the
+striped fill;
+(iv)~recording the rounding class in the version string itself;
+(v)~making the shader fallback observable, or optionally an error;
+(vi)~testing the longest ITS sequences the pipeline now aligns;
+and (vii)~offering these changes to the MAFFT maintainers.
+
+\section*{Acknowledgments}
+
+We thank Alan Rockefeller, who directed the dikarya1 work for Dikarya and made it public. His
+marker fill made our own builds faster, and his work prompted the multi-architecture
+exploration of opt7 and opt8, which paid off on every platform we measured.
 
 \begin{thebibliography}{99}\small
 \bibitem{katoh2002} K.~Katoh, K.~Misawa, K.~Kuma, T.~Miyata. MAFFT: a novel method for
