@@ -1184,7 +1184,11 @@ time 2{,}243, 425 and 354\,s): 5.1$\times$ over stock in wall time and 6.3$\time
 1.16$\times$ over opt4, with all 96 outputs identical to the references. Background load from the
 OS was higher than in Table~\ref{tab:wall4} (other processes used 0.6--1.4 cores, more during the
 optimized batches than during stock), so opt4's ratio came out at 4.4$\times$ rather than
-4.6$\times$.
+4.6$\times$. A second session, after the review fixes of the final commit, gave 5.3$\times$ (stock
+349\,s, opt8 66\,s), and also ran opt8 with the GPU off: 70\,s and 462\,s of CPU against 66\,s and
+370\,s with it. At this concurrency the GPU adds 6\% in wall time and saves a fifth of the CPU
+time, much less than in single runs: the refinement on the CPU dominates, and half of the eight
+concurrent jobs run on efficiency cores.
 
 \subsection{x86}
 
