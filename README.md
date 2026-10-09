@@ -30,8 +30,8 @@ GPUs. The vector code is chosen at compile time; everything else is shared.
 
 Speedup over stock MAFFT 7.526 built the same way on the same machine, wall time, `--thread 1`
 per run. "Pipeline L-INS-i" is the pipeline's test set of real ITS alignments (about 180
-sequences each): 16 of them run at the same time on a 4-vCPU instance (8 at a time on the M1),
-and single runs. Where the current version (`v7.526-opt8`) was not measured on a machine, the
+sequences each): a batch of 16 run four at a time on a 4-vCPU instance (eight at a time on the
+M1), and single runs. Where the current version (`v7.526-opt8`) was not measured on a machine, the
 row gives the most recent version that was.
 
 | machine | workload | version | several runs at once | single run |
@@ -57,8 +57,8 @@ without CUDA was 6.5× and 7.6×.
 The speedups depend on the workload and the hardware: sequence count and length, the
 alignment strategy, cache sizes and vector units. Other inputs may gain much less. On AWS,
 GPU instances pair the GPU with few CPU cores, and refinement, which stays on the CPU,
-dominates: the L4 costs about $1.10 per 1,000 pipeline alignments at on-demand prices,
-against about $0.17 on a c7a. The GPU path is for machines with a strong CPU and an idle GPU.
+dominates: at on-demand prices, and at the throughput of the 16-alignment batches, the L4 costs
+about $1.10 per 1,000 pipeline alignments, against about $0.17 on a c7a. The GPU path is for machines with a strong CPU and an idle GPU.
 
 The technical report [`paper/mafft-apple-silicon.pdf`](paper/mafft-apple-silicon.pdf)
 describes the methods, the verification and what didn't work in detail, including how the
@@ -159,7 +159,8 @@ State of `v7.526-opt8`:
 | AWS c7a (Zen 4) | clang+FMA AVX-512, with and without VBMI2 flags | 183/183 test alignments = Mac reference; canary 25/25; harnesses identical |
 | AWS c7a | gcc `x86-64-v3`, `x86-64-v4` | = stock gcc on a 43-alignment subset |
 | AWS c7i (Sapphire Rapids) | clang+FMA AVX-512 | canary 25/25 |
-| AWS c8g (Graviton4) | clang `-mcpu=neoverse-v1`; gcc | 183/183 = Mac reference; harnesses identical |
+| AWS c8g (Graviton4) | clang `-mcpu=neoverse-v1` | 183/183 = Mac reference; harnesses identical |
+| AWS c8g | gcc | harnesses identical (gcc builds match stock gcc, not the Mac) |
 | AWS g6 (L4, Zen 3 host) | clang+FMA `x86-64-v3` + CUDA | 183/183 = Mac reference; canary 25/25 with and without the GPU; 733,956 GPU alignments = CPU |
 | AWS g6 host (Zen 3, AVX2 only) | gcc `-march=broadwell` (the Dikarya host's build class) | 183/183 = `v7.526-opt5-dikarya1`; 13/13 canary windows = stock gcc; FFT-NS-i 16/16 = dikarya1 |
 

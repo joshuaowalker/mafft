@@ -1255,8 +1255,10 @@ barely slow each other there, whereas on the c7i two hyperthreads share each cor
 jobs give only about 2.2--2.3 times the throughput of one (approximate, since the single runs
 and the batches used different production shards). Over all 183 test shards at four concurrent, opt5-clang took 1{,}082\,s on the c7a and
 1{,}845\,s on the c7i. At us-west-2 prices at the time (on-demand \$0.205/h for c7a.xlarge and
-\$0.1785/h for c7i.xlarge), opt5-clang costs about \$0.25 per 1{,}000 shards on the c7a and
-\$0.33--0.36 on the c7i; at a week's range of Spot prices, \$0.11--0.15 and \$0.12--0.20.
+\$0.1785/h for c7i.xlarge) and at the throughput of the 16-shard production batches, opt5-clang
+costs about \$0.25 per 1{,}000 shards on the c7a and \$0.33--0.36 on the c7i; the full test set,
+whose targeted windows are larger, costs more per shard (about \$0.34 and \$0.50 from the totals
+above); at a week's range of Spot prices, \$0.11--0.15 and \$0.12--0.20.
 The deployment uses the c7a, with the c7i as a Spot fallback, since the two give identical
 output. For comparison, opt4 on the M1 aligns about 930 shards per hour at 8 concurrent.
 
@@ -1298,7 +1300,8 @@ Zen 3 host, AVX2 only, gcc & opt8 & 5.9$\times$ & 7.1$\times$ \\
 Cross-session ratios carry the drift noted above: the c7i ran up to 15\% slower in one session
 than another, while on the c8g opt7 timed in two sessions agreed within 1\%. On the L4 instance
 the GPU added 1.24$\times$ to opt8 and was idle in most five-second samples: the refinement, which
-stays on the CPU, dominates. At on-demand prices that is about \$1.10 per 1{,}000 shards, against
+stays on the CPU, dominates. At on-demand prices and the throughput of the 16-shard batches, that
+is about \$1.10 per 1{,}000 shards, against
 about \$0.17 on a c7a with opt8 and \$0.11 on a c8a with opt7.
 
 \section{What did not work, and limitations}
